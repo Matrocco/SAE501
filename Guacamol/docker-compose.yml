@@ -40,6 +40,16 @@ services:
       - postgres
     networks:
       - guac_network
+      
+proxmox_sync:
+    container_name: proxmox_sync_script
+    image: mon_script_sync:v1 
+    build: ./proxmox-sync 
+    restart: "no"
+    depends_on:
+      - postgres
+    networks:
+      - guac_network
 
 networks:
   guac_network:

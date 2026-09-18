@@ -1,0 +1,11122 @@
+#!/usr/bin/env python3
+"""
+Guacamole VM Manager
+
+A script to add VMs to Guacamole and manage Wake-on-LAN functionality.
+Integrates with Guacamole and Proxmox APIs for seamless VM management.
+
+Author: Johannes
+Date: September 27, 2025
+"""
+
+# Check for alternative help options early, before other imports
+import sys
+
+help_options = ["-h", "--h", "-help"]
+if len(sys.argv) > 1 and sys.argv[1] in help_options:
+    sys.argv[1] = "--help"
+
+import requests
+import os
+import socket
+import json
+import urllib3
+from urllib.parse import urljoin
+import getpass
+import base64
+import hashlib
+from cryptography.fernet import Fernet, InvalidToken
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union, cast, Set
+import types
+import time
+import subprocess
+import re
+import ipaddress
+import platform
+from dataclasses import dataclass
+
+import typer  # type: ignore[import-error]
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.prompt import Confirm, Prompt, FloatPrompt
+import questionary  # type: ignore[import-untyped]
+from concurrent.futures import Future
+
+# Pylint: some imports intentionally live inside functions to avoid heavy startup
+# or circular imports. Also some 'pass' statements are used intentionally to
+# silence non-critical exceptions in probing code paths. Disable the following
+# checks at module level to reduce noisy warnings.
+# pylint: disable=import-outside-toplevel, unnecessary-pass
+
+# Cross-platform readline compatibility shim
+# Windows doesn't have readline in stdlib; provide a minimal compatible interface
+try:
+    import readline
+except ImportError:
+    try:
+        import pyreadline as readline  # type: ignore[import-untyped]
+    except ImportError:
+        # Create a minimal shim with no-op methods
+        import types
+
+        class _ReadlineShim:
+            """Minimal readline-compatible shim for platforms without readline support."""
+
+            @staticmethod
+            def get_completer() -> None:
+                return None
+
+            @staticmethod
+            def set_completer(completer: Any) -> None:
+                pass
+
+            @staticmethod
+            def parse_and_bind(string: str) -> None:
+                pass
+
+        readline = _ReadlineShim()  # type: ignore[assignment]
+        sys.modules['readline'] = readline  # type: ignore[assignment]
+
+# Global verbose flags (set by Typer commands)
+verbose_mode = False
+verbose_log_file = None
+raw_mode = False  # Global flag for raw/plain output mode (no colors, animations)
+
+# Global flags for VM add operations
+auto_approve_mode = False
+start_vm_auto = False
+restore_power_auto = False
+
+try:
+    from config import Config
+except ImportError:
+    print("Error: config.py not found!")
+    print(" Please copy config_example.py to config.py and customize your settings.")
+    print("   cp config_example.py config.py")
+    sys.exit(1)
+
+# Disable SSL warnings for self-signed certificates
+# SECURITY NOTE: This is intentional for internal infrastructure tools.
+# Static analysis tools (DeepSource, Bandit) will flag this as B501/security issue.
+# This is ACCEPTABLE because:
+# 1. Tool is designed for trusted internal networks with known endpoints
+# 2. Self-signed certificates are standard in internal Proxmox/Guacamole deployments
+# 3. Configuration is user-controlled (config.py is git-ignored)
+# 4. No untrusted external input flows into SSL connections
+# See SECURITY.md for full security policy and acceptable risk documentation.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Initialize Rich console and Typer app
+console = Console()
+app = typer.Typer(
+    name="guac-vm-manager",
+    help=(
+        "● Guacamole VM Manager - Sync Proxmox VMs with Apache Guacamole\n\n"
+        "Automatically creates remote desktop connections (RDP/VNC/SSH) in Apache Guacamole "
+        "by parsing VM credentials from Proxmox VM notes and now highlights smart actions "
+        "to keep environments healthy.\n\n"
+        "Use [cyan]--raw[/cyan] flag for plain text output (no colors/animations)"
+    ),
+    rich_markup_mode="rich",
+)
+
+
+ONBOARD_SENTINEL = os.path.expanduser("~/.guac_vm_manager_onboarded")
+
+
+class PasswordDecryptionError(Exception):
+    """Raised when stored credential passwords cannot be decrypted."""
+
+    def __init__(
+        self,
+        message: str,
+        encrypted_payload: str,
+        details: Optional[str] = None,
+        root_cause: Optional[Exception] = None,
+    ) -> None:
+        super().__init__(message)
+        self.encrypted_payload = encrypted_payload
+        self.details = details
+        self.root_cause = root_cause
+
+    def format_diagnostics(self) -> str:
+        root = f"{type(self.root_cause).__name__}: {self.root_cause}" if self.root_cause else "<unknown>"
+        info_lines = [self.args[0]]
+        if self.details:
+            info_lines.append(self.details)
+        info_lines.append(f"Root cause: {root}")
+        info_lines.append(
+            f"Ciphertext length: {len(self.encrypted_payload)} characters (preview: {self.encrypted_payload[:8]}…)"
+        )
+        info_lines.append(
+            "Verify that Config.ENCRYPTION_KEY matches the key that was originally used to encrypt this VM's notes."
+        )
+        return "\n".join(info_lines)
+
+
+class CredentialRecoveryPending(Exception):
+    """Raised when credential decryption fails and requires user intervention."""
+
+    def __init__(
+        self,
+        decrypt_error: PasswordDecryptionError,
+        username: str,
+        vm_name: str,
+        vm_id: str,
+        vm_node: str,
+        params: Dict[str, str],
+        raw_line: str,
+    ) -> None:
+        super().__init__(decrypt_error.args[0])
+        self.decrypt_error = decrypt_error
+        self.username = username
+        self.vm_name = vm_name
+        self.vm_id = vm_id
+        self.vm_node = vm_node
+        self.params = params.copy()
+        self.raw_line = raw_line
+
+
+@dataclass
+class SmartAction:
+    key: str
+    label: str
+    description: str
+    handler: Callable[[], None]
+    severity: str = "info"
+    detail: Optional[str] = None
+    category: str = "both"  # "guacamole", "proxmox", or "both"
+
+
+def _format_smart_action_label(action: SmartAction) -> str:
+    icon_map = {
+        "warning": ("⚠", "yellow"),
+        "error": ("✗", "red"),
+        "success": ("✓", "green"),
+        "info": ("ℹ", "cyan"),
+    }
+    icon, color = icon_map.get(action.severity, ("•", "white"))
+    
+    # Add category icons (skip if raw mode)
+    category_icon = ""
+    if not raw_mode:
+        if action.category == "guacamole":
+            category_icon = "[bold green]⬢[/bold green] "  # Hexagon for Guacamole
+        elif action.category == "proxmox":
+            category_icon = "[bold orange1]⬢[/bold orange1] "  # Hexagon for Proxmox
+        elif action.category == "both":
+            category_icon = "[bold orange1]⬢[/bold orange1]→[bold green]⬢[/bold green] "  # Combined with arrow
+    
+    if raw_mode:
+        # Plain text output without colors
+        return f"{icon} {action.label}" + (f" - {action.description}" if action.description else "")
+    
+    base = f"{category_icon}[{color}]{icon} {action.label}[/{color}]"
+    if action.description:
+        return f"{base} — {action.description}"
+    return base
+
+
+class SyncAnimation:
+    """Hexagon-based sync animation for Proxmox→Guacamole operations."""
+    
+    def __init__(self, description: str = "Syncing"):
+        self.description = description
+        self.frames = [
+            "[bold orange1]⬢[/bold orange1]   [dim]⬢[/dim]",  # Proxmox active
+            "[bold orange1]⬢[/bold orange1] → [dim]⬢[/dim]",  # Arrow appears
+            "[dim]⬢[/dim] → [bold green]⬢[/bold green]",     # Guacamole active
+            "[dim]⬢[/dim]   [bold green]⬢[/bold green]",     # Guacamole stays
+        ]
+        self.frame_index = 0
+    
+    def __enter__(self) -> "SyncAnimation":
+        """Context manager entry - returns self for use in 'with' statements."""
+        if raw_mode:
+            # In raw mode, just print a simple message
+            print(f"{self.description}...")
+            return self
+        return self
+    
+    def __exit__(self, exc_type: Optional[Type[BaseException]], exc_val: Optional[BaseException], exc_tb: Optional[types.TracebackType]) -> None:
+        """Context manager exit."""
+        if not raw_mode and hasattr(self, '_status'):
+            self._status.stop()
+        return None
+    
+    def start(self) -> None:
+        """Start the animation (only in non-raw mode)."""
+        if raw_mode:
+            return
+        self._status = console.status(
+            f"{self.frames[0]} {self.description}...",
+            spinner="dots"
+        )
+        self._status.start()
+    
+    def update(self, message: Optional[str] = None) -> None:
+        """Update animation message."""
+        if raw_mode:
+            if message:
+                print(f"  {message}")
+            return
+        if hasattr(self, '_status') and self._status:
+            self.frame_index = (self.frame_index + 1) % len(self.frames)
+            display_msg = message or self.description
+            self._status.update(f"{self.frames[self.frame_index]} {display_msg}...")
+    
+    def stop(self, final_message: Optional[str] = None) -> None:
+        """Stop the animation with optional final message."""
+        if raw_mode:
+            if final_message:
+                print(f"✓ {final_message}")
+            return
+        if hasattr(self, '_status') and self._status:
+            self._status.stop()
+        if final_message:
+            console.print(f"[green]✓ {final_message}[/green]")
+
+
+def safe_print(message: str, style: str = "") -> None:
+    """Print with conditional styling based on raw_mode."""
+    if raw_mode:
+        # Strip Rich markup for raw mode
+        import re
+        clean_message = re.sub(r'\[/?[^\]]+\]', '', message)
+        print(clean_message)
+    else:
+        if style:
+            console.print(f"[{style}]{message}[/{style}]")
+        else:
+            console.print(message)
+
+
+def safe_panel(content: str, title: str = "", border_style: str = "cyan") -> None:
+    """Display panel with conditional formatting."""
+    if raw_mode:
+        # Plain text box
+        import re
+        clean_content = re.sub(r'\[/?[^\]]+\]', '', content)
+        print(f"\n{'=' * 60}")
+        if title:
+            print(f" {title}")
+            print('=' * 60)
+        print(clean_content)
+        print('=' * 60 + '\n')
+    else:
+        from rich.panel import Panel
+        console.print(Panel(content, title=title, border_style=border_style))
+
+
+def safe_table(title: str = "") -> Any:
+    """Create table with conditional formatting."""
+    if raw_mode:
+        # Return a simple dict-based table simulator
+        return {"title": title, "rows": []}
+    else:
+        from rich.table import Table
+        return Table(title=title, show_header=True, header_style="bold cyan")
+
+
+def _discover_pending_connections(
+    prox_api: "ProxmoxAPI", guac_api: "GuacamoleAPI"
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return VMs awaiting sync and those requiring password intervention."""
+
+    pending_sync: List[Dict[str, Any]] = []
+    password_issues: List[Dict[str, Any]] = []
+
+    try:
+        connections = guac_api.get_connections() or {}
+    except Exception:
+        return pending_sync, password_issues
+
+    existing_names = {
+        conn.get("name")
+        for conn in connections.values()
+        if conn.get("name")
+    }
+
+    try:
+        nodes = prox_api.get_nodes()
+    except Exception:
+        return pending_sync, password_issues
+
+    scanned_vm_count = 0
+    for node in nodes:
+        node_name = node.get("node")
+        if not node_name:
+            continue
+
+        try:
+            vms = prox_api.get_vms(node_name)
+        except Exception:
+            continue
+
+        for vm in vms:
+            if scanned_vm_count >= 60:
+                break
+
+            vmid = vm.get("vmid")
+            if vmid is None:
+                continue
+
+            try:
+                vm_config = prox_api.get_vm_config(node_name, vmid)
+            except Exception:
+                continue
+
+            notes = vm_config.get("description", "") or vm_config.get("notes", "")
+            if not notes:
+                continue
+
+            try:
+                creds = prox_api.parse_credentials_from_notes(
+                    notes,
+                    vm.get("name", ""),
+                    str(vmid),
+                    node_name,
+                    prompt_on_decrypt_failure=False,
+                )
+            except CredentialRecoveryPending as pending:
+                password_issues.append(
+                    {
+                        "name": vm.get("name", f"VM-{vmid}"),
+                        "vmid": vmid,
+                        "node": node_name,
+                        "username": pending.username,
+                        "diagnostics": pending.decrypt_error.format_diagnostics(),
+                    }
+                )
+                continue
+
+            missing_conns = [
+                cred.get("connection_name")
+                for cred in creds
+                if cred.get("connection_name")
+                and cred.get("connection_name") not in existing_names
+            ]
+            if missing_conns:
+                pending_sync.append(
+                    {
+                        "name": vm.get("name", f"VM-{vmid}"),
+                        "vmid": vmid,
+                        "node": node_name,
+                        "connections": missing_conns,
+                    }
+                )
+
+            scanned_vm_count += 1
+
+        if scanned_vm_count >= 60:
+            break
+
+    return pending_sync, password_issues
+
+
+def find_duplicate_connections(guac_api: "GuacamoleAPI") -> List[Dict[str, Any]]:
+    """
+    Find duplicate connections in Guacamole.
+    Duplicates are connections with the same hostname, port, and protocol but different names.
+    Returns a list of duplicate groups.
+    """
+    try:
+        connections = guac_api.get_connections() or {}
+    except Exception:
+        return []
+    
+    # Build a signature for each connection: hostname + port + protocol + username (for RDP/SSH)
+    signature_map: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for conn_id, conn_data in connections.items():
+        name = conn_data.get("name", "")
+        protocol = conn_data.get("protocol", "").lower()
+        
+        # Get parameters (may need to fetch details)
+        params = conn_data.get("parameters", {})
+        if not params:
+            try:
+                details = guac_api.get_connection_details(conn_id)
+                params = details.get("parameters", {})
+            except Exception:
+                continue
+        
+        hostname = params.get("hostname", "")
+        port = params.get("port", "")
+        username = params.get("username", "")
+        
+        if not hostname or not protocol:
+            continue
+        
+        # Create signature: protocol + hostname + port + username (for protocols that use it)
+        # VNC doesn't use username, so we exclude it for VNC
+        if protocol == "vnc":
+            signature = f"{protocol}://{hostname}:{port}"
+        else:
+            signature = f"{protocol}://{username}@{hostname}:{port}"
+        
+        if signature not in signature_map:
+            signature_map[signature] = []
+        
+        signature_map[signature].append({
+            "id": conn_id,
+            "name": name,
+            "protocol": protocol,
+            "hostname": hostname,
+            "port": port,
+            "username": username,
+        })
+    
+    # Find signatures with multiple connections (duplicates)
+    duplicate_groups: List[Dict[str, Any]] = []
+    for signature, connections_list in signature_map.items():
+        if len(connections_list) > 1:
+            duplicate_groups.append({
+                "signature": signature,
+                "connections": connections_list,
+            })
+    
+    return duplicate_groups
+
+
+def delete_duplicate_connections(guac_api: "GuacamoleAPI", duplicate_groups: List[Dict[str, Any]]) -> None:
+    """
+    Interactively delete duplicate connections, letting user choose which to keep.
+    """
+    console.print(Panel(" Cleaning up duplicate connections", border_style="cyan"))
+    
+    deleted_count = 0
+    kept_count = 0
+    
+    for group in duplicate_groups:
+        connections = group["connections"]
+        signature = group["signature"]
+        
+        if len(connections) <= 1:
+            continue
+        
+        console.print(f"\n[cyan]Duplicate group: {signature}[/cyan]")
+        console.print(f"Found {len(connections)} duplicate connection(s):\n")
+        
+        # Show all connections with numbers
+        for idx, conn in enumerate(connections, 1):
+            console.print(f"  [{idx}] {conn['name']}")
+        
+        # Ask user which to keep
+        while True:
+            try:
+                choice = console.input(f"\n[yellow]Which connection do you want to KEEP? (1-{len(connections)}, or 's' to skip): [/yellow]").strip().lower()
+                
+                if choice == 's':
+                    console.print("[yellow]Skipped this group[/yellow]")
+                    break
+                
+                choice_num = int(choice)
+                if 1 <= choice_num <= len(connections):
+                    keep_idx = choice_num - 1
+                    keep = connections[keep_idx]
+                    to_delete = [c for i, c in enumerate(connections) if i != keep_idx]
+                    
+                    console.print(f"\n  [green]✓ Keeping: {keep['name']}[/green]")
+                    
+                    # Delete the others
+                    for conn in to_delete:
+                        try:
+                            if guac_api.delete_connection(conn["id"]):
+                                console.print(f"  [yellow]✗ Deleted: {conn['name']}[/yellow]")
+                                deleted_count += 1
+                            else:
+                                console.print(f"  [red]✗ Failed to delete: {conn['name']}[/red]")
+                        except Exception as e:
+                            console.print(f"  [red]✗ Error deleting {conn['name']}: {e}[/red]")
+                    
+                    kept_count += 1
+                    break
+                else:
+                    console.print(f"[red]Please enter a number between 1 and {len(connections)}[/red]")
+            except ValueError:
+                console.print("[red]Invalid input. Please enter a number or 's' to skip.[/red]")
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Cancelled.[/yellow]")
+                return
+            except Exception as e:
+                console.print(f"  [red]✗ Error during deletion: {e}[/red]")
+        
+        kept_count += 1
+    
+    console.print(f"\n[green]✓ Cleanup complete: kept {kept_count} connection(s), deleted {deleted_count} duplicate(s)[/green]")
+
+
+def compute_smart_actions() -> Tuple[List[SmartAction], List[str]]:
+    """Inspect current environment and build prioritized smart actions."""
+
+    messages: List[str] = []
+    actions: List[SmartAction] = []
+
+    try:
+        config = Config()
+    except Exception as err:
+        messages.append(f"[red]Failed to load config: {err}[/red]")
+        return actions, messages
+
+    prox_api = ProxmoxAPI(config)
+    guac_api = GuacamoleAPI(config)
+
+    prox_ok = False
+    guac_ok = False
+
+    try:
+        prox_ok = prox_api.test_auth()
+    except Exception as err:
+        messages.append(f"[red]Proxmox authentication failed: {err}[/red]")
+
+    try:
+        guac_ok = guac_api.authenticate()
+    except Exception as err:
+        messages.append(f"[red]Guacamole authentication failed: {err}[/red]")
+
+    key_iter = iter("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    def next_key() -> str:
+        try:
+            return next(key_iter)
+        except StopIteration:  # pragma: no cover - defensive
+            return str(len(actions) + 1)
+
+    if not prox_ok or not guac_ok:
+
+        def run_auth_test() -> None:
+            console.print("\n[cyan]Running authentication diagnostics...[/cyan]")
+            prox_status = prox_api.test_auth()
+            try:
+                _ = guac_api.authenticate()
+            except Exception as exc:
+                console.print(f"[red]Guacamole auth failed: {exc}[/red]")
+            else:
+                console.print("[green]✓ Guacamole API authentication successful[/green]")
+            console.print(
+                "[green]✓ Proxmox API authentication successful[/green]"
+                if prox_status
+                else "[red]✗ Proxmox API authentication failed[/red]"
+            )
+
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label="Test API authentication",
+                description="Validate connectivity and credentials for both APIs",
+                handler=run_auth_test,
+                severity="warning",
+                category="both",
+            )
+        )
+        return actions, messages
+
+    # Both APIs authenticated; gather deeper insights
+    try:
+        sync_issues = collect_out_of_sync_vms(config, prox_api, guac_api)
+    except Exception as err:
+        sync_issues = []
+        messages.append(f"[yellow]Sync analysis unavailable: {err}[/yellow]")
+
+    if sync_issues:
+        password_issue_count = sum(
+            1 for issue in sync_issues if issue.get("requires_password_input")
+        )
+
+        def run_repair() -> None:
+            repair_out_of_sync(
+                auto_approve=False,
+                dry_run=False,
+                config=config,
+                proxmox_api=prox_api,
+                guac_api=guac_api,
+            )
+
+        tail = (
+            f" ({password_issue_count} password fix{'es' if password_issue_count != 1 else ''})"
+            if password_issue_count
+            else ""
+        )
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label=f"Repair {len(sync_issues)} out-of-sync VM(s)",
+                description=f"Reconciles Guacamole with Proxmox notes{tail}",
+                handler=run_repair,
+                severity="warning",
+                category="both",
+            )
+        )
+
+    pending_sync, password_lockouts = _discover_pending_connections(prox_api, guac_api)
+
+    if pending_sync:
+
+        def run_auto_sync() -> None:
+            auto_process_all_vms(force=False, skip_existing=True)
+
+        unique_vms = {entry["vmid"] for entry in pending_sync}
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label=f"Sync {len(unique_vms)} VM(s) awaiting setup",
+                description="Creates missing Guacamole connections from VM notes",
+                handler=run_auto_sync,
+                severity="info",
+                category="both",
+            )
+        )
+
+    if password_lockouts and not sync_issues:
+
+        def run_repair_passwords() -> None:
+            repair_out_of_sync(
+                auto_approve=False,
+                dry_run=False,
+                config=config,
+                proxmox_api=prox_api,
+                guac_api=guac_api,
+            )
+
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label=f"Resolve {len(password_lockouts)} password mismatch issue(s)",
+                description="Prompts for updated credentials and re-encrypts notes",
+                handler=run_repair_passwords,
+                severity="warning",
+                category="both",
+            )
+        )
+
+    encryption_key = getattr(config, "ENCRYPTION_KEY", "") or ""
+    if not encryption_key.strip():
+
+        def show_encryption_guidance() -> None:
+            console.print(
+                Panel(
+                    "Password encryption is inactive.\n\n"
+                    "Add an ENCRYPTION_KEY value to config.py (same passphrase on all environments).\n"
+                    "We recommend a high-entropy phrase; the application derives a 32-byte key automatically.",
+                    title="Enable credential encryption",
+                    border_style="yellow",
+                )
+            )
+
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label="Configure password encryption",
+                description="Set Config.ENCRYPTION_KEY to secure stored passwords",
+                handler=show_encryption_guidance,
+                severity="warning",
+                category="proxmox",
+            )
+        )
+
+    if not os.path.exists(ONBOARD_SENTINEL):
+
+        def run_onboarding_wizard() -> None:
+            run_onboarding()
+
+        actions.append(
+            SmartAction(
+                key=next_key(),
+                label="Run onboarding wizard",
+                description="Guides you through initial environment configuration",
+                handler=run_onboarding_wizard,
+                severity="info",
+                category="both",
+            )
+        )
+
+    # Check for duplicate connections (same hostname + port + protocol but different names)
+    try:
+        duplicates = find_duplicate_connections(guac_api)
+        if duplicates:
+            
+            def cleanup_duplicates() -> None:
+                delete_duplicate_connections(guac_api, duplicates)
+            
+            total_dupes = sum(len(group["connections"]) - 1 for group in duplicates)
+            actions.append(
+                SmartAction(
+                    key=next_key(),
+                    label=f"Remove {total_dupes} duplicate connection(s)",
+                    description=f"Found {len(duplicates)} group(s) with duplicate connections (same target, different names)",
+                    handler=cleanup_duplicates,
+                    severity="warning",
+                    category="guacamole",
+                )
+            )
+    except Exception as err:
+        messages.append(f"[yellow]Duplicate check unavailable: {err}[/yellow]")
+
+    # Check for ungrouped connections that could benefit from organization
+    try:
+        connections = guac_api.get_connections()
+        if connections:
+            ungrouped_count = 0
+            connection_details: Dict[str, Dict[str, Any]] = {}
+            
+            # Quick scan to count ungrouped connections
+            for conn_id, conn in connections.items():
+                parent_id = conn.get("parentIdentifier")
+                if not parent_id or parent_id == "ROOT":
+                    ungrouped_count += 1
+                    # Get details for analysis (lightweight check)
+                    details = guac_api.get_connection_details(conn_id)
+                    connection_details[conn_id] = {
+                        "name": conn.get("name", ""),
+                        "protocol": conn.get("protocol", ""),
+                        "params": details.get("parameters", {}),
+                        "group": parent_id,
+                    }
+            
+            # Only analyze if we have enough ungrouped connections to make grouping worthwhile
+            if ungrouped_count >= 3:
+                # Quick analysis to see if there are grouping opportunities
+                from collections import defaultdict
+                hostname_groups: Dict[str, List[str]] = defaultdict(list)
+                
+                for conn_id, details in connection_details.items():
+                    if not details["group"] or details["group"] == "ROOT":
+                        hostname = details["params"].get("hostname", "")
+                        if hostname:
+                            hostname_groups[hostname].append(conn_id)
+                
+                # Count how many groups could be created (same hostname = multi-user access)
+                potential_groups = sum(1 for conns in hostname_groups.values() if len(conns) >= 2)
+                
+                if potential_groups > 0:
+                    
+                    def run_autogroup() -> None:
+                        autogroup_connections()
+                    
+                    actions.append(
+                        SmartAction(
+                            key=next_key(),
+                            label=f"Organize {ungrouped_count} ungrouped connection(s)",
+                            description=f"Found {potential_groups} potential group(s) to improve organization",
+                            handler=run_autogroup,
+                            severity="info",
+                            category="guacamole",
+                        )
+                    )
+    except Exception as err:
+        messages.append(f"[yellow]Grouping analysis unavailable: {err}[/yellow]")
+
+    if not actions:
+        messages.append("[green]No urgent smart actions detected. You're all set![/green]")
+
+    return actions, messages
+
+
+def complete_protocols(incomplete: str) -> List[str]:
+    """Provide completion for protocol types"""
+    protocols = ["rdp", "vnc", "ssh"]
+    return [proto for proto in protocols if proto.startswith(incomplete.lower())]
+
+
+# Enhanced input functions with completion support
+def enhanced_input(
+    prompt: str, default: str = "", suggestions: Optional[List[str]] = None
+) -> str:
+    """Enhanced input function with basic completion support"""
+    # Use module-level readline (includes cross-platform shim)
+    # Set up completion if suggestions are provided
+    if suggestions:
+
+        def completer(text: str, state: int) -> Optional[str]:
+            matches = [s for s in suggestions if s.lower().startswith(text.lower())]
+            try:
+                return matches[state]
+            except IndexError:
+                return None
+
+        # Save original completer
+        old_completer = readline.get_completer()  # type: ignore[attr-defined]
+        readline.set_completer(completer)  # type: ignore[attr-defined]
+        readline.parse_and_bind("tab: complete")  # type: ignore[attr-defined]
+
+        try:
+            # Show suggestions if available
+            if suggestions and len(suggestions) > 0:
+                console.print(
+                    f"[dim]Available options: {', '.join(suggestions[:5])}{'...' if len(suggestions) > 5 else ''}[/dim]"
+                )
+
+            result = console.input(prompt).strip()
+            return result if result else default
+        finally:
+            # Restore original completer
+            readline.set_completer(old_completer)  # type: ignore[attr-defined]
+    else:
+        result = console.input(prompt).strip()
+        return result if result else default
+
+
+def get_connection_suggestions() -> List[str]:
+    """Get list of existing connection names for completion"""
+    try:
+        config = Config()
+        guac_api = GuacamoleAPI(config)
+        if guac_api.authenticate():
+            connections = guac_api.get_connections()
+            return [
+                conn.get("name", "")
+                for conn in connections.values()
+                if conn.get("name")
+            ]
+        return []
+    except Exception:
+        return []
+
+
+def interactive_menu_with_navigation(
+    options: List[Tuple[str, str]], prompt: str = "Select option"
+) -> str:
+    """Enhanced menu with TAB/arrow key navigation"""
+    tty_module = None
+    termios_module = None
+    try:
+        import tty as tty_module  # type: ignore
+        import termios as termios_module  # type: ignore
+        has_termios = True
+    except ImportError:
+        has_termios = False
+
+    # Try to import Windows-specific keyboard input
+    msvcrt_module = None
+    try:
+        import msvcrt as msvcrt_module  # type: ignore
+        has_msvcrt = True
+    except ImportError:
+        has_msvcrt = False
+
+    if not options:
+        return ""
+
+    canonical_map: Dict[str, str] = {}
+    valid_choices: List[str] = []
+
+    for key, _ in options:
+        if not key:
+            continue
+        if key == "0/q":
+            canonical_map.setdefault("0", "0")
+            canonical_map.setdefault("q", "q")
+            if "0" not in valid_choices:
+                valid_choices.append("0")
+            if "q" not in valid_choices:
+                valid_choices.append("q")
+            continue
+        canonical_map.setdefault(key.lower(), key)
+        if key not in valid_choices:
+            valid_choices.append(key)
+
+    exit_present = any(opt[0] in ["0", "0/q"] for opt in options)
+    if not exit_present and "0" not in valid_choices:
+        valid_choices.append("0")
+        canonical_map.setdefault("0", "0")
+    if "q" not in valid_choices:
+        valid_choices.append("q")
+    canonical_map.setdefault("q", "q")
+
+    def normalize_choice(raw: str) -> Optional[str]:
+        lowered = raw.lower()
+        if lowered in canonical_map:
+            return canonical_map[lowered]
+        return None
+
+    # Windows navigation using msvcrt
+    if not has_termios and has_msvcrt:
+        if msvcrt_module is None:
+            raise RuntimeError("msvcrt keyboard navigation requested but module is unavailable")
+        current_index = 0
+        while current_index < len(options) and not options[current_index][0]:
+            current_index += 1
+        if current_index >= len(options):
+            current_index = 0
+        while True:
+            # Clear and redraw
+            console.clear()
+            
+            # Show menu with current selection highlighted
+            console.print(f"[bold cyan]{prompt}[/bold cyan]")
+            console.print(
+                "[dim]Use TAB/Arrow keys to navigate, ENTER to select, or type choice directly[/dim]\n"
+            )
+            
+            for i, (choice, desc) in enumerate(options):
+                if not desc:
+                    continue
+                if choice:
+                    if i == current_index:
+                        console.print(
+                            f"[bold white on blue] {choice} [/bold white on blue] [cyan]{desc}[/cyan]"
+                        )
+                    else:
+                        console.print(f" {choice}  {desc}")
+                else:
+                    console.print(f"   {desc}")
+            
+            console.print(
+                f"\n[dim]Current selection: {options[current_index][0] if current_index < len(options) else ''}[/dim]"
+            )
+            
+            # Get single character input
+            ch = msvcrt_module.getch()  # type: ignore[attr-defined]
+            
+            if ch == b'\x1b':  # ESC key
+                return "q"
+            elif ch == b'\xe0':  # Extended key prefix (arrow keys on Windows)
+                ch2 = msvcrt_module.getch()  # type: ignore[attr-defined]
+                if ch2 == b'H':  # Up arrow
+                    current_index = max(0, current_index - 1)
+                    # Skip separators
+                    while current_index >= 0 and (
+                        not options[current_index][0]
+                        or not options[current_index][1]
+                    ):
+                        current_index -= 1
+                    current_index = max(0, current_index)
+                elif ch2 == b'P':  # Down arrow
+                    current_index = min(len(options) - 1, current_index + 1)
+                    # Skip separators
+                    while current_index < len(options) and (
+                        not options[current_index][0]
+                        or not options[current_index][1]
+                    ):
+                        current_index += 1
+                    current_index = min(len(options) - 1, current_index)
+            elif ch == b'\t':  # TAB
+                current_index = (current_index + 1) % len(options)
+                # Skip separators
+                start_index = current_index
+                while not options[current_index][0] or not options[current_index][1]:
+                    current_index = (current_index + 1) % len(options)
+                    if current_index == start_index:  # Prevent infinite loop
+                        break
+            elif ch == b'\r':  # ENTER
+                if current_index < len(options) and options[current_index][0]:
+                    return options[current_index][0]
+            elif ch in [b'q', b'Q']:
+                return "q"
+            elif ch == b'\x03':  # Ctrl+C
+                return "q"
+            else:
+                decoded = ch.decode('utf-8', errors='ignore')
+                if decoded.lower() == 'q':
+                    return 'q'
+                normalized = normalize_choice(decoded)
+                if normalized:
+                    return normalized
+                if decoded.isdigit() and decoded in valid_choices:
+                    return decoded
+    
+    # Fallback for non-Windows systems without termios - simple input
+    elif not has_termios:
+        console.clear()
+        console.print(f"[bold cyan]{prompt}[/bold cyan]")
+        console.print("[dim]Type your choice and press Enter[/dim]\n")
+        
+        for choice, desc in options:
+            if not desc:
+                continue
+            if choice:
+                console.print(f" {choice}  {desc}")
+            else:
+                console.print(f"   {desc}")
+        
+        while True:
+            try:
+                choice = input("\nEnter your choice: ").strip()
+                normalized = normalize_choice(choice)
+                if normalized:
+                    return normalized
+                elif choice.lower() in ['q', 'quit', 'exit']:
+                    return "q"
+                else:
+                    console.print(f"[red]Invalid choice: {choice}[/red]")
+            except (EOFError, KeyboardInterrupt):
+                return "q"
+
+    # Unix/macOS - fancy navigation
+    current_index = 0
+    while current_index < len(options) and not options[current_index][0]:
+        current_index += 1
+    if current_index >= len(options):
+        current_index = 0
+    while True:
+        # Clear and redraw
+        console.clear()
+
+        # Show menu with current selection highlighted
+        console.print(f"[bold cyan]{prompt}[/bold cyan]")
+        console.print(
+            "[dim]Use TAB/Arrow keys to navigate, ENTER to select, or type choice directly[/dim]\n"
+        )
+
+        for i, (choice, desc) in enumerate(options):
+            if not desc:
+                continue
+            if choice:
+                if i == current_index:
+                    console.print(
+                        f"[bold white on blue] {choice} [/bold white on blue] [cyan]{desc}[/cyan]"
+                    )
+                else:
+                    console.print(f" {choice}  {desc}")
+            else:
+                console.print(f"   {desc}")
+
+        console.print(
+            f"\n[dim]Current selection: {options[current_index][0] if current_index < len(options) else ''}[/dim]"
+        )
+
+        # Get single character input
+        fd = sys.stdin.fileno()
+        if termios_module is None or tty_module is None:
+            raise RuntimeError("termios keyboard navigation requested but termios module is unavailable")
+
+        old_settings = termios_module.tcgetattr(fd)  # type: ignore[attr-defined]
+
+        try:
+            tty_module.setraw(sys.stdin.fileno())  # type: ignore[attr-defined]
+            ch = sys.stdin.read(1)
+
+            # Handle special keys
+            if ch == "\x1b":  # ESC sequence
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A":  # Up arrow
+                        current_index = max(0, current_index - 1)
+                        # Skip separators
+                        while current_index >= 0 and (
+                            not options[current_index][0]
+                            or not options[current_index][1]
+                        ):
+                            current_index -= 1
+                        current_index = max(0, current_index)
+                    elif ch3 == "B":  # Down arrow
+                        current_index = min(len(options) - 1, current_index + 1)
+                        # Skip separators
+                        while current_index < len(options) and (
+                            not options[current_index][0]
+                            or not options[current_index][1]
+                        ):
+                            current_index += 1
+                        current_index = min(len(options) - 1, current_index)
+            elif ch == "\t":  # TAB
+                current_index = (current_index + 1) % len(options)
+                # Skip separators
+                start_index = current_index
+                while not options[current_index][0] or not options[current_index][1]:
+                    current_index = (current_index + 1) % len(options)
+                    if current_index == start_index:  # Prevent infinite loop
+                        break
+            elif ch in ("\r", "\n"):  # ENTER
+                if current_index < len(options) and options[current_index][0]:
+                    return options[current_index][0]
+            elif ch in "qQ":
+                return "q"
+            elif ch == "\x03":  # Ctrl+C
+                return "q"
+            else:
+                normalized = normalize_choice(ch)
+                if normalized:
+                    return normalized
+                if ch.isdigit() and ch in valid_choices:
+                    return ch
+
+        finally:
+            tcs_drain = getattr(termios_module, "TCSADRAIN", 0)
+            termios_module.tcsetattr(fd, tcs_drain, old_settings)  # type: ignore[attr-defined]
+
+    return ""
+
+
+class AnimationManager:
+    """Lightweight frame-based terminal animations (auto-disabled in non-TTY/tests).
+
+    Usage:
+        with AnimationManager("Authenticating", style="green") as anim:
+            anim.update("Phase 2...")
+    """
+
+    FRAMES_SIMPLE = ["-", "\\", "|", "/"]
+    FRAMES_DOTS = ["∙  ", "∙∙ ", "∙∙∙", " ∙∙", "  ∙"]
+    FRAMES_BRAILLE = ["⣾", "⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽"]
+
+    def __init__(
+        self,
+        title: str,
+        style: str = "cyan",
+        frames: Optional[List[str]] = None,
+        interval: float = 0.08,
+    ):
+        self.title = title
+        self.style = style
+        self.frames = frames or self.FRAMES_BRAILLE
+        self.interval = interval
+        self._stop = False
+        self._thread: Optional[Any] = None  # set in __enter__
+        self.enabled = (
+            sys.stdout.isatty()
+            and not os.environ.get("PYTEST_CURRENT_TEST")
+            and not os.environ.get("GUAC_DISABLE_ANIM")
+        )
+        self.current_msg = title
+
+    def update(self, msg: str) -> None:
+        self.current_msg = msg
+
+    def __enter__(self) -> "AnimationManager":
+        if not self.enabled:
+            return self
+        import threading
+
+        def run() -> None:
+            idx = 0
+            while not self._stop:
+                frame = self.frames[idx % len(self.frames)]
+                console.print(
+                    f"[bold {self.style}]{frame}[/bold {self.style}] {self.current_msg}    ",
+                    end="\r",
+                )
+                time.sleep(self.interval)
+                idx += 1
+            # Clear line
+            console.print(" " * 80, end="\r")
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]], exc: Optional[BaseException], tb: Optional[types.TracebackType]) -> None:
+        if not self.enabled:
+            return None
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        # Final line
+        status = "DONE" if exc is None else "ERROR"
+        console.print(
+            f"[bold {('green' if exc is None else 'red')}]{status}[/bold {('green' if exc is None else 'red')}] {self.title}"
+        )
+        return None
+
+
+def run_onboarding() -> None:
+    """First-time onboarding flow (or invoked by --onboarding).
+
+    Adds validation of the encryption key so users immediately know if
+    password-at-rest protection will function. If the key is invalid,
+    offers an interactive regeneration (when TTY).
+    """
+    console.print(Panel.fit(" Guacamole VM Manager Onboarding ", border_style="cyan"))
+    steps = [
+        "Checking environment",
+        "Validating config.py",
+        "Validating encryption key",
+        "Testing Guacamole authentication",
+        "Testing Proxmox authentication",
+        "Explaining VM notes format",
+        "Next steps",
+    ]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Starting onboarding...", total=len(steps))
+        guac_auth_ok = prox_auth_ok = enc_ok = False
+        for s in steps:
+            progress.update(task, description=s)
+            # Perform actual logic per step
+            if s == "Checking environment":
+                time.sleep(0.1)
+            elif s == "Validating config.py":
+                # Basic presence checks
+                missing: List[str] = []
+                try:
+                    from config import Config as _Cfg  # local import
+
+                    required = [
+                        "GUAC_BASE_URL",
+                        "GUAC_USERNAME",
+                        "GUAC_PASSWORD",
+                        "PROXMOX_HOST",
+                        "PROXMOX_TOKEN_ID",
+                        "PROXMOX_SECRET",
+                    ]
+                    for attr in required:
+                        if not getattr(_Cfg, attr, None):
+                            missing.append(attr)
+                    if missing:
+                        console.print(
+                            f"[red]Missing config attributes: {', '.join(missing)}[/red]"
+                        )
+                    else:
+                        console.print("[green]config.py basic values present[/green]")
+                except Exception as e:
+                    console.print(f"[red]Failed to import config: {e}[/red]")
+            elif s == "Validating encryption key":
+                try:
+                    from config import Config as _Cfg  # re-import safe
+
+                    key = getattr(_Cfg, "ENCRYPTION_KEY", None)
+                    if not key:
+                        console.print("[red]ENCRYPTION_KEY missing in config.py[/red]")
+                    else:
+                        try:
+
+                            fernet = Fernet(key)
+                            test_plain = b"verification-test"
+                            token = fernet.encrypt(test_plain)
+                            if fernet.decrypt(token) == test_plain:
+                                console.print(
+                                    "[green]Encryption key is valid (encrypt/decrypt successful)[/green]"
+                                )
+                                console.print(
+                                    "Note: Any plain passwords in VM notes will be auto-migrated to encrypted form."
+                                )
+                                enc_ok = True
+                            else:
+                                console.print(
+                                    "[red]Encryption key round-trip failed[/red]"
+                                )
+                        except Exception as e:
+                            console.print(f"[red]Invalid ENCRYPTION_KEY: {e}[/red]")
+                            # Offer regeneration if interactive
+                            if sys.stdin.isatty():
+                                resp = (
+                                    input(
+                                        "Generate and patch a new Fernet key into config.py now? (y/N): "
+                                    )
+                                    .strip()
+                                    .lower()
+                                )
+                                if resp in ("y", "yes"):
+                                    try:
+
+                                        new_key = Fernet.generate_key().decode()
+                                        # Patch config.py line in-place
+                                        cfg_path = os.path.join(
+                                            os.path.dirname(__file__), "config.py"
+                                        )
+                                        try:
+                                            with open(
+                                                cfg_path, "r", encoding="utf-8"
+                                            ) as cf:
+                                                content = cf.readlines()
+                                            for i, line in enumerate(content):
+                                                if (
+                                                    line.strip().startswith(
+                                                        "ENCRYPTION_KEY"
+                                                    )
+                                                    or "ENCRYPTION_KEY =" in line
+                                                ):
+                                                    # Preserve indentation
+                                                    indent = line[
+                                                        : len(line) - len(line.lstrip())
+                                                    ]
+                                                    content[i] = (
+                                                        f'{indent}ENCRYPTION_KEY = "{new_key}"\n'
+                                                    )
+                                                    break
+                                            with open(
+                                                cfg_path, "w", encoding="utf-8"
+                                            ) as cf:
+                                                cf.writelines(content)
+                                            console.print(
+                                                "[green]Generated and wrote new ENCRYPTION_KEY to config.py[/green]"
+                                            )
+                                            enc_ok = True
+                                        except Exception as werr:
+                                            console.print(
+                                                f"[red]Failed to write new key: {werr}[/red]"
+                                            )
+                                    except Exception as gerr:
+                                        console.print(
+                                            f"[red]Could not generate key: {gerr}[/red]"
+                                        )
+                            else:
+                                console.print(
+                                    "Run interactively to auto-generate a new Fernet key, or manually run: from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+                                )
+                except Exception as e:
+                    console.print(f"[red]Encryption key validation error: {e}[/red]")
+            elif s == "Testing Guacamole authentication":
+                try:
+                    from config import Config as _Cfg
+
+                    cfg_obj = _Cfg()
+                    ga = GuacamoleAPI(cfg_obj)
+                    if ga.authenticate():
+                        console.print("[green]Guacamole auth OK[/green]")
+                        guac_auth_ok = True
+                    else:
+                        console.print("[red]Guacamole auth failed[/red]")
+                except Exception as e:
+                    console.print(f"[red]Guacamole auth error: {e}[/red]")
+            elif s == "Testing Proxmox authentication":
+                try:
+                    from config import Config as _Cfg
+
+                    cfg_obj = _Cfg()
+                    pa = ProxmoxAPI(cfg_obj)
+                    if pa.test_auth():
+                        prox_auth_ok = True
+                    else:
+                        console.print("[red]Proxmox auth failed[/red]")
+                except Exception as e:
+                    console.print(f"[red]Proxmox auth error: {e}[/red]")
+            elif s == "Explaining VM notes format":
+                console.print("\nStructured credential line examples:")
+                console.print(
+                    '  user:"admin" pass:"P@ss" protos:"rdp,vnc,ssh" rdp_port:"3390" vnc_port:"5901" confName:"{vmname}-{user}-{proto}";'
+                )
+                console.print(
+                    '  user:"viewer" pass:"view123" protos:"vnc" vnc_settings:"color-depth=16,encoding=raw,read-only=true";'
+                )
+                console.print(
+                    "Lines end with semicolons; unrecognized free-form lines are preserved but ignored for parsing."
+                )
+            elif s == "Next steps":
+                console.print("\nNext steps:")
+                console.print(
+                    "  • Add structured lines to VM notes (or let auto-migration encrypt existing ones)."
+                )
+                console.print("  • Run 'auto' mode to create/update connections.")
+                console.print(
+                    "  • Use the sync option to pull settings back from Guacamole if needed."
+                )
+                # Summarize statuses
+                console.print("\nStatus summary:")
+                console.print(f"  Encryption key: {'OK' if enc_ok else 'ISSUE'}")
+                console.print(f"  Guacamole auth: {'OK' if guac_auth_ok else 'ISSUE'}")
+                console.print(f"  Proxmox API: {'OK' if prox_auth_ok else 'ISSUE'}")
+            progress.advance(task)
+
+    console.print("\n[bold green]Onboarding complete.[/bold green]")
+    console.print("A quick start:")
+    console.print("  1. Put credential lines in Proxmox VM notes.")
+    console.print("  2. Run: uv run python guac_vm_manager.py (interactive).")
+    console.print("  3. Choose option 2 to auto-add all configured VMs.")
+    try:
+        with open(ONBOARD_SENTINEL, "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+
+class GuacamoleAPI:
+    """Handles Guacamole API interactions"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+        # Disable SSL verification for self-signed certificates (intentional, see SECURITY.md)
+        self.session.verify = False  # nosec B501
+        self.auth_token = None
+
+        # Load cached working endpoints from config
+        self._working_base_path = getattr(config, "GUAC_WORKING_BASE_PATH", None)
+        self._working_data_source = (
+            getattr(config, "GUAC_WORKING_DATA_SOURCE", None) or config.GUAC_DATA_SOURCE
+        )
+        self._endpoints_discovered = False  # Track if endpoints were freshly discovered
+        self._config_saved = False  # Track if we've already saved config this session
+
+        preferred_sources = [
+            config.GUAC_DATA_SOURCE,
+            "mysql",
+            "postgresql",
+            "sqlserver",
+        ]
+        # Preserve order while removing duplicates
+        self.data_sources: List[str] = []
+        for source in preferred_sources:
+            if source and source not in self.data_sources:
+                self.data_sources.append(source)
+
+        self.api_base_paths: List[str] = []
+        for data_source in self.data_sources:
+            self.api_base_paths.append(f"/guacamole/api/session/data/{data_source}")
+            self.api_base_paths.append(f"/api/session/data/{data_source}")
+
+    def _save_working_endpoints_to_config(self) -> None:
+        """Save discovered working endpoints to config file for future runs"""
+        if not self._working_base_path or not self._working_data_source:
+            return
+
+        # Only save if endpoints were freshly discovered
+        if not self._endpoints_discovered:
+            return
+
+        # Don't save if config already has the correct main data source
+        if self.config.GUAC_DATA_SOURCE == self._working_data_source:
+            return
+
+        from pathlib import Path
+
+        config_path = Path(__file__).parent / "config.py"
+        if not config_path.exists():
+            return
+
+        try:
+            # Read current config
+            with open(config_path, "r") as f:
+                content = f.read()
+
+            needs_update = False
+
+            # Check if GUAC_DATA_SOURCE needs updating (if it doesn't match discovered value)
+            if self.config.GUAC_DATA_SOURCE != self._working_data_source:
+                needs_update = True
+
+            # Check if GUAC_WORKING_BASE_PATH needs updating
+            if f'GUAC_WORKING_BASE_PATH = "{self._working_base_path}"' not in content:
+                needs_update = True
+
+            # Check if GUAC_WORKING_DATA_SOURCE needs updating
+            if (
+                f'GUAC_WORKING_DATA_SOURCE = "{self._working_data_source}"'
+                not in content
+            ):
+                needs_update = True
+
+            if not needs_update:
+                return
+
+            # Update GUAC_WORKING_BASE_PATH
+            base_path_pattern = r"(GUAC_WORKING_BASE_PATH\s*=\s*)[^#\n]*"
+            if re.search(base_path_pattern, content):
+                content = re.sub(
+                    base_path_pattern, rf'\1"{self._working_base_path}"', content
+                )
+            else:
+                # Add it after GUAC_DATA_SOURCE
+                content = re.sub(
+                    r"(GUAC_DATA_SOURCE\s*=\s*[^#\n]*)\n",
+                    rf'\1\n    GUAC_WORKING_BASE_PATH = "{self._working_base_path}"  # Auto-discovered\n',
+                    content,
+                )
+
+            # Update GUAC_WORKING_DATA_SOURCE
+            if "GUAC_WORKING_DATA_SOURCE =" not in content:
+                # Add it after GUAC_WORKING_BASE_PATH
+                content = content.replace(
+                    'GUAC_WORKING_BASE_PATH = "/api"# "/api" or "/guacamole/api"',
+                    'GUAC_WORKING_BASE_PATH = "/api"  # Auto-discovered\n    GUAC_WORKING_DATA_SOURCE = "postgresql"  # Auto-discovered',
+                )
+
+            # Update GUAC_DATA_SOURCE if it doesn't match discovered value
+            if self.config.GUAC_DATA_SOURCE != self._working_data_source:
+                data_source_pattern = r"(GUAC_DATA_SOURCE\s*=\s*)[^#\n]*"
+                content = re.sub(
+                    data_source_pattern, rf'\1"{self._working_data_source}"', content
+                )
+                # Update the comment to indicate it was auto-corrected
+                content = re.sub(
+                    rf'(GUAC_DATA_SOURCE\s*=\s*"{self._working_data_source}")(\s*#.*)?',
+                    "\1  # Auto-corrected to match server",
+                    content,
+                )
+
+            # Write back to config
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # Update class attributes for this session
+            setattr(Config, 'GUAC_WORKING_BASE_PATH', self._working_base_path)
+            setattr(Config, 'GUAC_WORKING_DATA_SOURCE', self._working_data_source)
+            if self.config.GUAC_DATA_SOURCE != self._working_data_source:
+                setattr(Config, 'GUAC_DATA_SOURCE', self._working_data_source)
+
+            console.print(
+                "[green]✓ Saved discovered endpoints to config for faster future runs[/green]"
+            )
+            self._config_saved = True  # Mark that we've saved this session
+
+        except Exception as e:
+            console.print(f"[yellow]⚠ Could not save endpoints to config: {e}[/yellow]")
+
+    def _make_request_with_spinner(
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        """Make an HTTP request with a loading spinner animation"""
+
+        # Create a smart description for the spinner showing variable parts
+        url_parts = url.replace(self.config.GUAC_BASE_URL, "").split("?")[0]
+        
+        # Intelligently identify static vs dynamic URL parts
+        parts = [p for p in url_parts.split('/') if p]  # Remove empty strings
+        
+        # Common static API keywords (lowercase for case-insensitive matching)
+        # Includes all Guacamole database names and API keywords
+        static_keywords = {
+            'api', 'session', 'sessions', 'data', 
+            # Database/datasource names
+            'postgresql', 'mysql', 'sqlserver', 'sqlite', 'h2', 'oracle', 'mariadb',
+            # API resource types
+            'connections', 'connectiongroups', 'groups', 'users', 'permissions', 
+            'parameters', 'tokens', 'history', 'activeconnections', 'tree', 
+            'sharingprofiles', 'attributes', 'usergroups', 'schema'
+        }
+        
+        # Identify dynamic parts (numbers, UUIDs, or not in static keywords)
+        dynamic_indices: List[int] = []
+        for i, part in enumerate(parts):
+            part_lower = part.lower()
+            # Dynamic if: all digits, or contains hyphens (UUID-like), or not a known keyword
+            if part.isdigit() or ('-' in part and not part_lower in static_keywords) or part_lower not in static_keywords:
+                dynamic_indices.append(i)
+        
+        # Build smart description
+        if len(parts) > 4 and dynamic_indices:
+            # Show first static part, compress middle, show dynamic parts
+            result_parts: List[str] = []
+            last_shown = -1
+            
+            # Always start with ... to indicate compression
+            if dynamic_indices and dynamic_indices[0] > 0:
+                result_parts.append('...')
+            
+            for idx in dynamic_indices:
+                # Show context around dynamic parts
+                if idx > 0 and parts[idx-1].lower() in static_keywords:
+                    # Show the static keyword before the dynamic value
+                    if last_shown < idx - 1 and len(result_parts) > 1:
+                        result_parts.append('...')
+                    if last_shown < idx - 1 or len(result_parts) == 1:
+                        result_parts.append(parts[idx-1])
+                    result_parts.append(parts[idx])
+                    last_shown = idx
+                else:
+                    if result_parts and last_shown < idx - 1 and len(result_parts) > 1:
+                        result_parts.append('...')
+                    result_parts.append(parts[idx])
+                    last_shown = idx
+            
+            if result_parts:
+                description = f"API {method.upper()} /{'/'.join(result_parts)}"
+            else:
+                description = f"API {method.upper()} {url_parts}"
+        else:
+            description = f"API {method.upper()} {url_parts}"
+
+        # Verbose logging
+        if verbose_mode:
+            log_msg = f"→ {method.upper()} {url}"
+            if "data" in kwargs:
+                log_msg += f"\n  Data: {kwargs['data']}"
+            if "json" in kwargs:
+                log_msg += f"\n  JSON: {kwargs['json']}"
+
+            if verbose_log_file:
+                with open(verbose_log_file, "a") as f:
+                    f.write(f"{log_msg}\n")
+            else:
+                console.print(f"[dim]{log_msg}[/dim]")
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task(description, total=None)
+            try:
+                start_time = time.time()
+                response = self.session.request(method, url, **kwargs)
+                elapsed = time.time() - start_time
+
+                # Verbose logging for response
+                if verbose_mode:
+                    response_msg = (
+                        f"← {response.status_code} {response.reason} ({elapsed:.1f}s)"
+                    )
+                    if response.headers.get("content-type", "").startswith(
+                        "application/json"
+                    ):
+                        try:
+                            json_data = response.json()
+                            response_msg += f"\n  Response: {json.dumps(json_data, indent=2)[:500]}{'...' if len(json.dumps(json_data)) > 500 else ''}"
+                        except:
+                            response_msg += f"\n  Response: {response.text[:200]}{'...' if len(response.text) > 200 else ''}"
+                    else:
+                        response_msg += f"\n  Response: {response.text[:200]}{'...' if len(response.text) > 200 else ''}"
+
+                    if verbose_log_file:
+                        with open(verbose_log_file, "a") as f:
+                            f.write(f"{response_msg}\n")
+                    else:
+                        console.print(f"[dim]{response_msg}[/dim]")
+
+                progress.update(task, description=f"{description} ({elapsed:.1f}s)")
+                return response
+            except Exception as e:
+                if verbose_mode:
+                    error_msg = f"← Request failed: {e}"
+                    if verbose_log_file:
+                        with open(verbose_log_file, "a") as f:
+                            f.write(f"{error_msg}\n")
+                    else:
+                        console.print(f"[dim]{error_msg}[/dim]")
+                progress.update(task, description=f"{description} (failed)")
+                raise e
+
+    def authenticate(self, silent: bool = False) -> bool:
+        """Authenticate with Guacamole and get auth token"""
+        # Check if we have a cached working base path
+        working_base_path = getattr(self, "_working_base_path", None)
+
+        if working_base_path:
+            # Try cached endpoint first
+            endpoints = [f"{working_base_path}/tokens"]
+        else:
+            # Try different possible endpoint paths
+            # /guacamole/api/tokens is for installations in subdirectories
+            # /api/tokens is for root installations or reverse proxy setups
+            endpoints = ["/guacamole/api/tokens", "/api/tokens"]
+
+        auth_data: Dict[str, str] = {
+            "username": self.config.GUAC_USERNAME,
+            "password": self.config.GUAC_PASSWORD,
+        }
+
+        if silent:
+            # Silent authentication for test-auth command
+            for endpoint in endpoints:
+                auth_url = urljoin(self.config.GUAC_BASE_URL, endpoint)
+                try:
+                    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                    response = self._make_request_with_spinner(
+                        "post", auth_url, data=auth_data, headers=headers
+                    )
+                    if response.status_code == 200:
+                        auth_response = response.json()
+                        self.auth_token = auth_response.get("authToken")
+                        if self.auth_token:
+                            # Cache the working base path for future API calls
+                            if "/guacamole/api" in auth_url:
+                                self._working_base_path = "/guacamole/api"
+                            else:
+                                self._working_base_path = "/api"
+
+                            # Extract and cache the working data source from auth response
+                            data_source = auth_response.get("dataSource")
+                            if data_source:
+                                self._working_data_source = data_source
+                                self._endpoints_discovered = (
+                                    True  # Mark as freshly discovered
+                                )
+                                # Save discovered endpoints to config
+                                self._save_working_endpoints_to_config()
+
+                            # Use Guacamole-Token header instead of query parameter (newer versions)
+                            self.session.headers.update(
+                                {"Guacamole-Token": self.auth_token}
+                            )
+                            return True
+                        # Silent failure, try next endpoint
+                        continue
+                    if response.status_code == 404:
+                        # Expected for installations without /guacamole prefix
+                        continue
+                    # Silent failure, try next endpoint
+                    continue
+
+                except requests.exceptions.RequestException:
+                    # Silent failure, try next endpoint
+                    continue
+        else:
+            # Normal authentication with animation
+            with AnimationManager("Authenticating with Guacamole"):
+                for endpoint in endpoints:
+                    auth_url = urljoin(self.config.GUAC_BASE_URL, endpoint)
+                    try:
+                        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+                        response = self._make_request_with_spinner(
+                            "post", auth_url, data=auth_data, headers=headers
+                        )
+                        if response.status_code == 200:
+                            auth_response = response.json()
+                            self.auth_token = auth_response.get("authToken")
+                            if self.auth_token:
+                                # Cache the working base path for future API calls
+                                if "/guacamole/api" in auth_url:
+                                    self._working_base_path = "/guacamole/api"
+                                else:
+                                    self._working_base_path = "/api"
+
+                                # Extract and cache the working data source from auth response
+                                data_source = auth_response.get("dataSource")
+                                if data_source:
+                                    self._working_data_source = data_source
+                                    self._endpoints_discovered = (
+                                        True  # Mark as freshly discovered
+                                    )
+                                    # Save discovered endpoints to config
+                                    self._save_working_endpoints_to_config()
+
+                                # Use Guacamole-Token header instead of query parameter (newer versions)
+                                self.session.headers.update(
+                                    {"Guacamole-Token": self.auth_token}
+                                )
+                                console.print(
+                                    Panel(
+                                        " Authentication successful!",
+                                        border_style="green",
+                                    )
+                                )
+                                return True
+                            # Silent failure, try next endpoint
+                            continue
+                        if response.status_code == 404:
+                            # Expected for installations without /guacamole prefix
+                            continue
+                        # Silent failure, try next endpoint
+                        continue
+
+                    except requests.exceptions.RequestException:
+                        # Silent failure, try next endpoint
+                        continue
+
+        if not silent:
+            console.print(
+                Panel(
+                    " Authentication failed - check credentials and server configuration",
+                    border_style="red",
+                )
+            )
+        return False
+
+    def _build_api_endpoints(self, resource: str) -> List[str]:
+        """Build API endpoints, prioritizing cached working endpoint if available"""
+        # Check if we have a cached working endpoint
+        working_data_source = getattr(self, "_working_data_source", None)
+        working_base_path = getattr(self, "_working_base_path", None)
+
+        if working_data_source and working_base_path:
+            # Return cached endpoint first, then all others as fallback
+            cached_endpoint = urljoin(
+                self.config.GUAC_BASE_URL,
+                f"{working_base_path}/session/data/{working_data_source}/{resource}",
+            )
+            return [cached_endpoint] + [
+                urljoin(self.config.GUAC_BASE_URL, f"{base}/{resource}")
+                for base in self.api_base_paths
+                if base != cached_endpoint
+            ]
+
+        # Fallback: try all possible endpoints
+        return [
+            urljoin(self.config.GUAC_BASE_URL, f"{base}/{resource}")
+            for base in self.api_base_paths
+        ]
+
+    def get_connections(self) -> Dict[str, Any]:
+        """Get list of existing connections"""
+        if not self.auth_token and not self.authenticate():
+            return {}
+
+        for connections_url in self._build_api_endpoints("connections"):
+            try:
+                response = self._make_request_with_spinner("get", connections_url)
+                if response.status_code == 200:
+                    # Always extract and cache the working data source from the successful URL
+                    if "/session/data/" in connections_url:
+                        parts = connections_url.split("/session/data/")
+                        if len(parts) > 1:
+                            data_source_part = parts[1].split("/")[0]
+                            self._working_data_source = data_source_part
+
+                    # Save working endpoints to config for future runs
+                    self._save_working_endpoints_to_config()
+
+                    return cast(Dict[str, Any], response.json())
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to get connections from {connections_url}: {response.status_code}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed for {connections_url}: {e}")
+                continue
+
+        print("Failed to get connections from all endpoints")
+        return {}
+
+    def get_connection_details(self, connection_id: str) -> Dict[str, Any]:
+        """Get detailed connection parameters for a specific connection"""
+        if not self.auth_token and not self.authenticate():
+            return {}
+
+        # Use cached working base path if available, otherwise try all paths
+        working_data_source = getattr(self, "_working_data_source", None)
+        working_base_path = getattr(self, "_working_base_path", None)
+
+        api_paths_to_try: List[str] = []
+        if working_data_source and working_base_path:
+            # Use cached working endpoint first
+            api_paths_to_try.append(
+                f"{working_base_path}/session/data/{working_data_source}"
+            )
+
+        # Add fallback paths if not already included
+        for base in self.api_base_paths:
+            if base not in api_paths_to_try:
+                api_paths_to_try.append(base)
+
+        # Try each API endpoint path
+        for api_base in api_paths_to_try:
+            try:
+                # First try to get connection details
+                detail_url = (
+                    f"{self.config.GUAC_BASE_URL}{api_base}/connections/{connection_id}"
+                )
+                response = self._make_request_with_spinner("get", detail_url)
+
+                if response.status_code == 200:
+                    connection_info = cast(Dict[str, Any], response.json())
+
+                    # Now try to get connection parameters
+                    params_url = f"{self.config.GUAC_BASE_URL}{api_base}/connections/{connection_id}/parameters"
+                    params_response = self._make_request_with_spinner("get", params_url)
+
+                    if params_response.status_code == 200:
+                        parameters = cast(Dict[str, Any], params_response.json())
+                        connection_info["parameters"] = parameters
+                    else:
+                        # If parameters endpoint fails, check if connection_info has parameters embedded
+                        if "parameters" not in connection_info:
+                            connection_info["parameters"] = {}
+                        if verbose_mode:
+                            print(f"Warning: Could not fetch parameters for connection {connection_id}: {params_response.status_code}")
+
+                    return connection_info
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to get connection details from {detail_url}: {response.status_code}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed: {e}")
+                continue
+
+        return {}
+
+    def connection_exists(self, name: str) -> bool:
+        """Check if a connection with the given name already exists"""
+        connections = self.get_connections()
+        # connections is a dict with identifiers as keys
+        return any(conn.get("name") == name for conn in connections.values())
+
+    def get_connection_groups(self) -> Dict[str, Any]:
+        """Get list of existing connection groups"""
+        if not self.auth_token and not self.authenticate():
+            return {}
+
+        for groups_url in self._build_api_endpoints("connectionGroups"):
+            try:
+                response = self._make_request_with_spinner("get", groups_url)
+                if response.status_code == 200:
+                    return cast(Dict[str, Any], response.json())
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to get connection groups from {groups_url}: {response.status_code}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed for {groups_url}: {e}")
+                continue
+
+        return {}
+
+    def connection_exists_by_details(
+        self, hostname: str, username: str, protocol: str
+    ) -> bool:
+        """Check if a connection already exists with the same hostname, username, and protocol"""
+        connections = self.get_connections()
+        for conn in connections.values():
+            params = conn.get("parameters", {})
+            if (
+                params.get("hostname") == hostname
+                and params.get("username") == username
+                and conn.get("protocol") == protocol
+            ):
+                return True
+        return False
+
+    def get_connection_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get connection details by name"""
+        connections = self.get_connections()
+        for conn in connections.values():
+            if cast(Dict[str, Any], conn).get("name") == name:
+                return cast(Dict[str, Any], conn)
+        return None
+
+    def get_connection_by_name_and_parent(
+        self, name: str, parent_identifier: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Get connection details by name and parent identifier"""
+        connections = self.get_connections()
+        target_parent = parent_identifier or "ROOT"
+        for conn in connections.values():
+            if (
+                cast(Dict[str, Any], conn).get("name") == name
+                and cast(Dict[str, Any], conn).get("parentIdentifier") == target_parent
+            ):
+                return cast(Dict[str, Any], conn)
+        return None
+
+    def update_connection(
+        self,
+        identifier: str,
+        name: str,
+        hostname: str,
+        username: str = "",
+        password: str = "",
+        port: int = 3389,
+        protocol: str = "rdp",
+        enable_wol: bool = True,
+        mac_address: str = "",
+        parent_identifier: Optional[str] = None,
+        rdp_settings: Optional[Dict[str, str]] = None,
+        wol_settings: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Update an existing connection"""
+        if not self.auth_token and not self.authenticate():
+            return False
+
+        if protocol == "rdp":
+            rdp_connection_data: Dict[str, Any] = {
+                "name": name,
+                "protocol": "rdp",
+                "parentIdentifier": parent_identifier or "ROOT",
+                "parameters": {
+                    "hostname": hostname,
+                    "port": str(port),
+                    "username": username,
+                    "password": password,
+                    "security": "any",
+                    "ignore-cert": "true",
+                    "enable-wallpaper": "true",
+                    "enable-theming": "true",
+                    "enable-font-smoothing": "true",
+                    "enable-full-window-drag": "true",
+                    "enable-desktop-composition": "true",
+                    "enable-menu-animations": "true",
+                    "resize-method": "display-update",
+                },
+                "attributes": {"max-connections": "2", "max-connections-per-user": "1"},
+            }
+
+            # Apply RDP setting overrides if provided
+            if rdp_settings:
+                for key, value in rdp_settings.items():
+                    if key.startswith("enable-"):
+                        rdp_connection_data["parameters"][key] = (
+                            "true" if value.lower() in ["true", "1", "yes"] else "false"
+                        )
+                    else:
+                        rdp_connection_data["parameters"][key] = value
+
+            # Add Wake-on-LAN parameters if enabled
+            if enable_wol and mac_address:
+                wol_params: Dict[str, str] = {
+                    "wol-send-packet": "true",
+                    "wol-mac-addr": mac_address,
+                    "wol-broadcast-addr": "255.255.255.255",
+                    "wol-udp-port": "9",
+                }
+
+                # Apply WoL setting overrides if provided
+                if wol_settings:
+                    for key, value in wol_settings.items():
+                        if key == "send-packet":
+                            wol_params["wol-send-packet"] = (
+                                "true"
+                                if value.lower() in ["true", "1", "yes"]
+                                else "false"
+                            )
+                        elif key == "broadcast-addr":
+                            wol_params["wol-broadcast-addr"] = value
+                        elif key == "udp-port":
+                            wol_params["wol-udp-port"] = str(value)
+
+                rdp_connection_data["parameters"].update(wol_params)
+            
+            connection_data = rdp_connection_data
+        else:  # VNC
+            # Default VNC parameters with enhanced options
+            vnc_params: Dict[str, str] = {
+                "hostname": hostname,
+                "port": str(port),
+                "password": password,
+                # Display and quality settings
+                "color-depth": "32",
+                "swap-red-blue": "false",
+                "cursor": "local",
+                "encoding": "tight",
+                # Clipboard and input settings
+                "enable-sftp": "false",
+                "disable-copy": "false",
+                "disable-paste": "false",
+                # Performance optimizations
+                "autoretry": "5",
+                "read-only": "false",
+            }
+
+            vnc_connection_data: Dict[str, Any] = {
+                "name": name,
+                "protocol": "vnc",
+                "parentIdentifier": parent_identifier or "ROOT",
+                "parameters": vnc_params,
+                "attributes": {"max-connections": "2", "max-connections-per-user": "1"},
+            }
+
+            if enable_wol and mac_address:
+                vnc_wol_params: Dict[str, str] = {
+                    "wol-send-packet": "true",
+                    "wol-mac-addr": mac_address,
+                    "wol-broadcast-addr": "255.255.255.255",
+                    "wol-udp-port": "9",
+                }
+
+                # Apply WoL setting overrides if provided
+                if wol_settings:
+                    for key, value in wol_settings.items():
+                        if key == "send-packet":
+                            vnc_wol_params["wol-send-packet"] = (
+                                "true"
+                                if value.lower() in ["true", "1", "yes"]
+                                else "false"
+                            )
+                        elif key == "broadcast-addr":
+                            vnc_wol_params["wol-broadcast-addr"] = value
+                        elif key == "udp-port":
+                            vnc_wol_params["wol-udp-port"] = str(value)
+
+                vnc_connection_data["parameters"].update(vnc_wol_params)
+            
+            connection_data = vnc_connection_data
+
+        # Ensure payload includes identifier and activeConnections per API docs
+        # activeConnections set to 0 for update operations
+        connection_data.setdefault("identifier", identifier)
+        connection_data.setdefault("activeConnections", 0)
+
+        # Use explicit headers per API documentation
+        headers = {
+            "Content-Type": "application/json;charset=utf-8",
+            "Accept": "application/json",
+        }
+
+        # Per documentation: only use the canonical PUT endpoint used by the Guacamole web UI
+        canonical_url = urljoin(
+            self.config.GUAC_BASE_URL,
+            f"/api/session/data/postgresql/connections/{identifier}",
+        )
+
+        try:
+            # The client must send the Guacamole-Token header obtained from authenticate(); do not attempt method overrides
+            if "Guacamole-Token" not in self.session.headers:
+                console.print(
+                    Panel(
+                        "Guacamole-Token header missing - ensure authenticate() succeeded and the server supports header-based tokens",
+                        title="Update failed",
+                        border_style="red",
+                    )
+                )
+                return False
+
+            resp = self._make_request_with_spinner(
+                "put", canonical_url, json=connection_data, headers=headers
+            )
+
+            if resp.status_code in (200, 204):
+                console.print(
+                    f"[green]Updated connection '{name}' (ID: {identifier})[/green]"
+                )
+                return True
+            console.print(
+                Panel(
+                    f"Failed to update connection via canonical endpoint {canonical_url}: {resp.status_code}\n{resp.text}",
+                    title="Update failed",
+                    border_style="red",
+                )
+            )
+            return False
+
+        except requests.exceptions.RequestException as e:
+            console.print(
+                Panel(
+                    f"Request error while updating connection via canonical endpoint: {e}",
+                    title="Update failed",
+                    border_style="red",
+                )
+            )
+            return False
+
+    def delete_connection(self, identifier: str) -> bool:
+        """Delete a connection by identifier"""
+        if not self.auth_token and not self.authenticate():
+            return False
+
+        # Try different delete endpoints
+        delete_endpoints: List[str] = []
+
+        # Build endpoints for deletion
+        for base_path in [
+            "/api/session/data/postgresql",
+            "/api/session/data/mysql",
+            "/guacamole/api/session/data/postgresql",
+            "/guacamole/api/session/data/mysql",
+        ]:
+            delete_endpoints.append(
+                f"{self.config.GUAC_BASE_URL}{base_path}/connections/{identifier}?token={self.auth_token}"
+            )
+
+        for endpoint in delete_endpoints:
+            try:
+                response = self._make_request_with_spinner("delete", endpoint)
+                if response.status_code in (200, 204):
+                    return True
+                if response.status_code == 404:
+                    continue
+                # Try alternative approach - some Guacamole versions need different method
+                continue
+            except requests.exceptions.RequestException:
+                continue
+
+        return False
+
+    def delete_connection_group(self, identifier: str) -> bool:
+        """Delete a connection group by identifier"""
+        if not self.auth_token and not self.authenticate():
+            return False
+
+        # Try different delete endpoints for connection groups
+        delete_endpoints: List[str] = []
+
+        # Build endpoints for deletion
+        for base_path in [
+            "/api/session/data/postgresql",
+            "/api/session/data/mysql",
+            "/guacamole/api/session/data/postgresql",
+            "/guacamole/api/session/data/mysql",
+        ]:
+            delete_endpoints.append(
+                f"{self.config.GUAC_BASE_URL}{base_path}/connectionGroups/{identifier}?token={self.auth_token}"
+            )
+
+        for endpoint in delete_endpoints:
+            try:
+                response = self._make_request_with_spinner("delete", endpoint)
+                if response.status_code in (200, 204):
+                    return True
+                if response.status_code == 404:
+                    continue
+                continue
+            except requests.exceptions.RequestException:
+                continue
+
+        return False
+
+    def move_connection_to_group(
+        self, connection_id: str, group_identifier: str
+    ) -> bool:
+        """Move a connection to a specific group"""
+        if not self.auth_token and not self.authenticate():
+            return False
+
+        # Get current connection details
+        connection_details = self.get_connection_details(connection_id)
+        if not connection_details:
+            return False
+
+        # Update the parentIdentifier to move to new group
+        connection_data = connection_details.copy()
+        connection_data["parentIdentifier"] = group_identifier
+
+        # Try different update endpoints
+        update_endpoints: List[str] = []
+        if (
+            hasattr(self, "_working_base_path")
+            and self._working_base_path
+            and hasattr(self, "_working_data_source")
+            and self._working_data_source
+        ):
+            # Use cached working endpoint
+            update_endpoints.append(
+                f"{self.config.GUAC_BASE_URL}{self._working_base_path}/session/data/{self._working_data_source}/connections/{connection_id}?token={self.auth_token}"
+            )
+        else:
+            # Fallback: try all possible endpoints
+            for base_path in [
+                "/api/session/data/postgresql",
+                "/api/session/data/mysql",
+                "/guacamole/api/session/data/postgresql",
+                "/guacamole/api/session/data/mysql",
+            ]:
+                update_endpoints.append(
+                    f"{self.config.GUAC_BASE_URL}{base_path}/connections/{connection_id}?token={self.auth_token}"
+                )
+
+        for endpoint in update_endpoints:
+            try:
+                response = self._make_request_with_spinner(
+                    "put", endpoint, json=connection_data
+                )
+                if response.status_code in (200, 204):
+                    return True
+                if response.status_code == 404:
+                    continue
+                continue
+            except requests.exceptions.RequestException:
+                continue
+
+        return False
+
+    def create_connection_group(
+        self,
+        name: str,
+        parent_identifier: str = "ROOT",
+        group_type: str = "ORGANIZATIONAL",
+    ) -> Optional[str]:
+        """Create a connection group to organize multiple connections"""
+        if not self.auth_token and not self.authenticate():
+            return None
+
+        payload: Dict[str, Any] = {
+            "name": name,
+            "parentIdentifier": parent_identifier,
+            "type": group_type,
+            "attributes": {
+                "max-connections": "",
+                "max-connections-per-user": "",
+                "enable-session-affinity": "",
+            },
+        }
+
+        for endpoint in self._build_api_endpoints("connectionGroups"):
+            try:
+                response = self._make_request_with_spinner(
+                    "post", endpoint, json=payload
+                )
+                if response.status_code in [
+                    200,
+                    201,
+                ]:  # Accept both 200 and 201 as success
+                    # Cache the working data source if not already cached
+                    if (
+                        not hasattr(self, "_working_data_source")
+                        or not self._working_data_source
+                    ) and "/session/data/" in endpoint:
+                        parts = endpoint.split("/session/data/")
+                        if len(parts) > 1:
+                            data_source_part = parts[1].split("/")[0]
+                            self._working_data_source = data_source_part
+                            self._save_working_endpoints_to_config()
+                    data = response.json()
+                    identifier = data.get("identifier")
+                    print(f"Created connection group '{name}' (ID: {identifier})")
+                    return cast(Optional[str], identifier)
+                if (
+                    response.status_code == 400
+                    and "already exists" in response.text.lower()
+                ):
+                    # Group already exists - try to find its identifier
+                    existing_groups = self.get_connection_groups()
+                    for group in existing_groups.values():
+                        if group.get("name") == name:
+                            print(
+                                f"Using existing connection group '{name}' (ID: {group.get('identifier')})"
+                            )
+                            return cast(Optional[str], group.get("identifier"))
+                    print(
+                        f"Warning: Group '{name}' exists but couldn't find ID - connections will be created at root level"
+                    )
+                    return None
+                if response.status_code == 404:
+                    continue
+                print(f"Failed to create group: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"Request failed for group creation: {e}")
+                continue
+
+        print("Unable to create connection group")
+        return None
+
+    def update_connection_group(
+        self,
+        group_identifier: str,
+        new_name: str,
+        parent_identifier: str = "ROOT",
+        group_type: str = "ORGANIZATIONAL",
+    ) -> bool:
+        """Update an existing connection group (rename, move, etc.) - intelligent API detection"""
+        if not self.auth_token and not self.authenticate():
+            return False
+
+        # First, determine the correct data source by checking what worked for authentication
+        working_data_source = getattr(self, "_working_data_source", None)
+        working_base_path = getattr(self, "_working_base_path", None)
+
+        if not working_data_source or not working_base_path:
+            # Fallback: detect working endpoint by trying to get groups first
+            for base_path in ["/guacamole/api", "/api"]:
+                for data_source in self.data_sources:
+                    test_url = f"{self.config.GUAC_BASE_URL}{base_path}/session/data/{data_source}/connectionGroups?token={self.auth_token}"
+                    try:
+                        test_response = self._make_request_with_spinner("get", test_url)
+                        if test_response.status_code == 200:
+                            working_data_source = data_source
+                            working_base_path = base_path
+                            # Cache for future use
+                            self._working_data_source = data_source
+                            self._working_base_path = base_path
+                            break
+                    except:
+                        continue
+                if working_data_source:
+                    break
+
+        if not working_data_source:
+            console.print("[red]✗ Could not determine working API endpoint[/red]")
+            return False
+
+        # Use the known working endpoint
+        endpoint = f"{self.config.GUAC_BASE_URL}{working_base_path}/session/data/{working_data_source}/connectionGroups/{group_identifier}?token={self.auth_token}"
+
+        payload: Dict[str, Any] = {
+            "identifier": group_identifier,
+            "name": new_name,
+            "parentIdentifier": parent_identifier,
+            "type": group_type,
+            "attributes": {
+                "max-connections": "",
+                "max-connections-per-user": "",
+                "enable-session-affinity": "",
+            },
+        }
+
+        try:
+            response = self._make_request_with_spinner("put", endpoint, json=payload)
+            if response.status_code in [200, 204]:  # Success codes
+                console.print(
+                    f"[green]✓ Successfully renamed group to '{new_name}'[/green]"
+                )
+                return True
+            console.print(
+                f"[red]✗ Failed to rename group: HTTP {response.status_code}[/red]"
+            )
+            if response.status_code == 405:
+                console.print(
+                    "[yellow]⚠ Method not allowed - check Guacamole permissions[/yellow]"
+                )
+            elif response.status_code == 403:
+                console.print(
+                    "[yellow]⚠ Access denied - insufficient permissions[/yellow]"
+                )
+            elif response.status_code == 404:
+                console.print(
+                    "[yellow]⚠ Group not found - may have been deleted[/yellow]"
+                )
+            return False
+        except requests.exceptions.RequestException as e:
+            console.print(f"[red]✗ Network error during group update: {e}[/red]")
+            return False
+
+    def create_rdp_connection(
+        self,
+        name: str,
+        hostname: str,
+        username: str = "",
+        password: str = "",
+        port: int = 3389,
+        enable_wol: bool = True,
+        mac_address: str = "",
+        parent_identifier: Optional[str] = None,
+        rdp_settings: Optional[Dict[str, str]] = None,
+        wol_settings: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Create RDP connection in Guacamole"""
+        if not self.auth_token and not self.authenticate():
+            return None
+
+        connection_data: Dict[str, Any] = {
+            "name": name,
+            "protocol": "rdp",
+            "parentIdentifier": parent_identifier or "ROOT",
+            "parameters": {
+                "hostname": hostname,
+                "port": str(port),
+                "username": username,
+                "password": password,
+                "security": "any",
+                "ignore-cert": "true",
+                "enable-wallpaper": "true",
+                "enable-theming": "true",
+                "enable-font-smoothing": "true",
+                "enable-full-window-drag": "true",
+                "enable-desktop-composition": "true",
+                "enable-menu-animations": "true",
+                "resize-method": "display-update",
+            },
+            "attributes": {"max-connections": "2", "max-connections-per-user": "1"},
+        }
+
+        # Apply RDP setting overrides if provided
+        if rdp_settings:
+            for key, value in rdp_settings.items():
+                if key.startswith("enable-"):
+                    # Convert to boolean
+                    connection_data["parameters"][key] = (
+                        "true" if value.lower() in ["true", "1", "yes"] else "false"
+                    )
+                else:
+                    connection_data["parameters"][key] = value
+
+        # Add Wake-on-LAN parameters if enabled
+        if enable_wol and mac_address:
+            wol_params: Dict[str, str] = {
+                "wol-send-packet": "true",
+                "wol-mac-addr": mac_address,
+                "wol-broadcast-addr": "255.255.255.255",
+                "wol-udp-port": "9",
+            }
+
+            # Apply WoL setting overrides if provided
+            if wol_settings:
+                for key, value in wol_settings.items():
+                    if key == "send-packet":
+                        wol_params["wol-send-packet"] = (
+                            "true" if value.lower() in ["true", "1", "yes"] else "false"
+                        )
+                    elif key.startswith("wol-"):
+                        wol_params[key] = value
+                    else:
+                        wol_params[f"wol-{key}"] = value
+
+            connection_data["parameters"].update(wol_params)
+
+        for endpoint in self._build_api_endpoints("connections"):
+            try:
+                response = self._make_request_with_spinner(
+                    "post", endpoint, json=connection_data
+                )
+                if response.status_code in (200, 201):
+                    # Cache the working data source if not already cached
+                    if (
+                        not hasattr(self, "_working_data_source")
+                        or not self._working_data_source
+                    ) and "/session/data/" in endpoint:
+                        parts = endpoint.split("/session/data/")
+                        if len(parts) > 1:
+                            data_source_part = parts[1].split("/")[0]
+                            self._working_data_source = data_source_part
+                            self._save_working_endpoints_to_config()
+                    data = response.json()
+                    identifier = data.get("identifier")
+                    print(
+                        f"Successfully created RDP connection '{name}' (ID: {identifier})"
+                    )
+                    return cast(Optional[str], identifier)
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to create RDP connection via {endpoint}: {response.status_code} {response.text}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Failed to create RDP connection via {endpoint}: {e}")
+                if hasattr(e, "response") and e.response is not None:
+                    print(f"Response: {e.response.text}")
+                continue
+
+        return None
+
+    def create_vnc_connection(
+        self,
+        name: str,
+        hostname: str,
+        password: str = "",
+        port: int = 5900,
+        enable_wol: bool = True,
+        mac_address: str = "",
+        parent_identifier: Optional[str] = None,
+        wol_settings: Optional[Dict[str, str]] = None,
+        vnc_settings: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Create VNC connection in Guacamole"""
+        if not self.auth_token and not self.authenticate():
+            return None
+
+        # Default VNC parameters with enhanced options
+        vnc_params: Dict[str, str] = {
+            "hostname": hostname,
+            "port": str(port),
+            "password": password,
+            # Display and quality settings
+            "color-depth": "32",
+            "swap-red-blue": "false",
+            "cursor": "local",
+            "encoding": "tight",
+            # Clipboard and input settings
+            "enable-sftp": "false",
+            "disable-copy": "false",
+            "disable-paste": "false",
+            # Performance optimizations
+            "autoretry": "5",
+            "read-only": "false",
+        }
+
+        # Apply VNC setting overrides if provided
+        if vnc_settings:
+            for key, value in vnc_settings.items():
+                if key.startswith("enable-") or key.startswith("disable-"):
+                    vnc_params[key] = (
+                        "true" if value.lower() in ["true", "1", "yes"] else "false"
+                    )
+                else:
+                    vnc_params[key] = value
+
+        connection_data: Dict[str, Any] = {
+            "name": name,
+            "protocol": "vnc",
+            "parentIdentifier": parent_identifier or "ROOT",
+            "parameters": vnc_params,
+            "attributes": {"max-connections": "2", "max-connections-per-user": "1"},
+        }
+
+        # Add Wake-on-LAN parameters if enabled
+        if enable_wol and mac_address:
+            wol_params: Dict[str, str] = {
+                "wol-send-packet": "true",
+                "wol-mac-addr": mac_address,
+                "wol-broadcast-addr": "255.255.255.255",
+                "wol-udp-port": "9",
+            }
+
+            # Apply WoL setting overrides if provided
+            if wol_settings:
+                for key, value in wol_settings.items():
+                    if key == "send-packet":
+                        wol_params["wol-send-packet"] = (
+                            "true" if value.lower() in ["true", "1", "yes"] else "false"
+                        )
+                    elif key.startswith("wol-"):
+                        wol_params[key] = value
+                    else:
+                        wol_params[f"wol-{key}"] = value
+
+            connection_data["parameters"].update(wol_params)
+
+        for endpoint in self._build_api_endpoints("connections"):
+            try:
+                response = self._make_request_with_spinner(
+                    "post", endpoint, json=connection_data
+                )
+                if response.status_code in (200, 201):
+                    # Cache the working data source if not already cached
+                    if (
+                        not hasattr(self, "_working_data_source")
+                        or not self._working_data_source
+                    ) and "/session/data/" in endpoint:
+                        parts = endpoint.split("/session/data/")
+                        if len(parts) > 1:
+                            data_source_part = parts[1].split("/")[0]
+                            self._working_data_source = data_source_part
+                            self._save_working_endpoints_to_config()
+                    data = response.json()
+                    identifier = data.get("identifier")
+                    print(
+                        f"Successfully created VNC connection '{name}' (ID: {identifier})"
+                    )
+                    return cast(Optional[str], identifier)
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to create VNC connection via {endpoint}: {response.status_code} {response.text}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Failed to create VNC connection via {endpoint}: {e}")
+                if hasattr(e, "response") and e.response is not None:
+                    print(f"Response: {e.response.text}")
+                continue
+
+        return None
+
+    def create_ssh_connection(
+        self,
+        name: str,
+        hostname: str,
+        username: str,
+        password: str = "",
+        port: int = 22,
+        enable_wol: bool = False,
+        mac_address: str = "",
+        parent_identifier: Optional[str] = None,
+        wol_settings: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Create SSH connection in Guacamole"""
+        if not self.authenticate():
+            return None
+
+        connection_data: Dict[str, Any] = {
+            "name": name,
+            "protocol": "ssh",
+            "parentIdentifier": parent_identifier or "ROOT",
+            "parameters": {
+                "hostname": hostname,
+                "port": str(port),
+                "username": username,
+                "color-scheme": "gray-black",  # Better readability
+                "font-name": "monospace",
+                "font-size": "12",
+                "enable-sftp": "true",  # Enable file transfer
+                "sftp-directory": "/home/" + username,  # Default to user home
+            },
+            "attributes": {"max-connections": "2", "max-connections-per-user": "1"},
+        }
+
+        # Add password if provided
+        if password:
+            connection_data["parameters"]["password"] = password
+
+        # Add Wake-on-LAN parameters if enabled
+        if enable_wol and mac_address:
+            wol_params: Dict[str, str] = {
+                "wol-send-packet": "true",
+                "wol-mac-addr": mac_address,
+                "wol-broadcast-addr": "255.255.255.255",
+                "wol-udp-port": "9",
+            }
+
+            # Apply WoL setting overrides if provided
+            if wol_settings:
+                for key, value in wol_settings.items():
+                    if key == "send-packet":
+                        wol_params["wol-send-packet"] = (
+                            "true" if value.lower() in ["true", "1", "yes"] else "false"
+                        )
+                    elif key.startswith("wol-"):
+                        wol_params[key] = value
+                    else:
+                        wol_params[f"wol-{key}"] = value
+
+            connection_data["parameters"].update(wol_params)
+
+        for endpoint in self._build_api_endpoints("connections"):
+            try:
+                response = self._make_request_with_spinner(
+                    "post", endpoint, json=connection_data
+                )
+                if response.status_code in (200, 201):
+                    # Cache the working data source if not already cached
+                    if (
+                        not hasattr(self, "_working_data_source")
+                        or not self._working_data_source
+                    ) and "/session/data/" in endpoint:
+                        parts = endpoint.split("/session/data/")
+                        if len(parts) > 1:
+                            data_source_part = parts[1].split("/")[0]
+                            self._working_data_source = data_source_part
+                            self._save_working_endpoints_to_config()
+                    data = response.json()
+                    identifier = data.get("identifier")
+                    print(
+                        f"Successfully created SSH connection '{name}' (ID: {identifier})"
+                    )
+                    return cast(Optional[str], identifier)
+                if response.status_code == 404:
+                    continue
+                print(
+                    f"Failed to create SSH connection via {endpoint}: {response.status_code} {response.text}"
+                )
+            except requests.exceptions.RequestException as e:
+                print(f"Failed to create SSH connection via {endpoint}: {e}")
+                if hasattr(e, "response") and e.response is not None:
+                    print(f"Response: {e.response.text}")
+                continue
+
+        return None
+
+
+class ProxmoxAPI:
+    """Handles Proxmox API interactions"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.session = requests.Session()
+        # Disable SSL verification for self-signed certificates (intentional, see SECURITY.md)
+        self.session.verify = False  # nosec B501
+        self.session.headers.update(
+            {
+                "Authorization": f"PVEAPIToken={self.config.PROXMOX_TOKEN_ID}={self.config.PROXMOX_SECRET}"
+            }
+        )
+        self._password_overrides: Dict[Tuple[str, str, str], str] = {}
+
+    def _make_request_with_spinner(
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        """Make an HTTP request with a loading spinner animation"""
+
+        # Create a smart description for the spinner showing variable parts
+        url_parts = url.replace(self.config.proxmox_base_url, "").split("?")[0]
+        
+        # Intelligently identify static vs dynamic URL parts
+        parts = [p for p in url_parts.split('/') if p]  # Remove empty strings
+        
+        # Common static API keywords for Proxmox (lowercase)
+        static_keywords = {
+            'api2', 'json', 'nodes', 'qemu', 'lxc', 'storage', 'status', 
+            'current', 'config', 'firewall', 'snapshot', 'clone', 'migrate',
+            'network', 'dns', 'version', 'access', 'users', 'groups', 'roles',
+            'pools', 'ha', 'resources', 'tasks', 'cluster', 'backup'
+        }
+        
+        # Identify dynamic parts (node names, VMIDs, storage names, etc.)
+        dynamic_indices: List[int] = []
+        for i, part in enumerate(parts):
+            part_lower = part.lower()
+            # Dynamic if: all digits (VMID), or not a known static keyword
+            if part.isdigit() or part_lower not in static_keywords:
+                # But keep 'json' and 'api2' as static
+                if part_lower not in {'json', 'api2'}:
+                    dynamic_indices.append(i)
+        
+        # Build smart description showing dynamic values with context
+        if len(parts) > 3 and dynamic_indices:
+            result_parts: List[str] = []
+            last_shown = -1
+            
+            # Always start with ... to indicate compression
+            if dynamic_indices and dynamic_indices[0] > 0:
+                result_parts.append('...')
+            
+            for idx in dynamic_indices:
+                # Show the static keyword before dynamic value for context
+                if idx > 0 and parts[idx-1].lower() in static_keywords:
+                    if last_shown < idx - 1 and len(result_parts) > 1:
+                        result_parts.append('...')
+                    if last_shown < idx - 1 or len(result_parts) == 1:
+                        result_parts.append(parts[idx-1])
+                    result_parts.append(parts[idx])
+                    last_shown = idx
+                else:
+                    if result_parts and last_shown < idx - 1 and len(result_parts) > 1:
+                        result_parts.append('...')
+                    result_parts.append(parts[idx])
+                    last_shown = idx
+            
+            if result_parts:
+                description = f"API {method.upper()} /{'/'.join(result_parts)}"
+            else:
+                description = f"API {method.upper()} {url_parts}"
+        else:
+            description = f"API {method.upper()} {url_parts}"
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task(description, total=None)
+            try:
+                start_time = time.time()
+                response = self.session.request(method, url, **kwargs)
+                elapsed = time.time() - start_time
+                progress.update(task, description=f"{description} ({elapsed:.1f}s)")
+                return response
+            except Exception as e:
+                progress.update(task, description=f"{description} (failed)")
+                raise e
+
+    def test_auth(self) -> bool:
+        """Test Proxmox API authentication"""
+        try:
+            response = self._make_request_with_spinner(
+                "get", f"{self.config.proxmox_base_url}/version"
+            )
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+
+    def get_nodes(self) -> List[Dict[str, Any]]:
+        """Get list of Proxmox nodes"""
+        nodes_url = f"{self.config.proxmox_base_url}/nodes"
+
+        try:
+            response = self._make_request_with_spinner("get", nodes_url)
+            response.raise_for_status()
+            data = response.json()
+            nodes = data.get("data", [])
+            return cast(List[Any], nodes)
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to get nodes: {e}")
+            return []
+
+    def get_node_ips(self) -> List[str]:
+        """Get IP addresses of all Proxmox nodes"""
+        nodes = self.get_nodes()
+        node_ips: List[str] = []
+
+        for node_info in nodes:
+            node_name = node_info["node"]
+            network_url = f"{self.config.proxmox_base_url}/nodes/{node_name}/network"
+
+            try:
+                response = self._make_request_with_spinner("get", network_url)
+                response.raise_for_status()
+                data = response.json()
+                interfaces = data.get("data", [])
+
+                # Extract IP addresses from network interfaces
+                for interface in interfaces:
+                    if "cidr" in interface and interface.get("type") == "bridge":
+                        # Parse CIDR notation to get IP
+                        cidr = interface["cidr"]
+                        if "/" in cidr:
+                            ip = cidr.split("/")[0]
+                            if ip not in node_ips:
+                                node_ips.append(ip)
+            except requests.exceptions.RequestException:
+                # If network endpoint fails, try to get IP from node status
+                try:
+                    status_url = (
+                        f"{self.config.proxmox_base_url}/nodes/{node_name}/status"
+                    )
+                    response = self._make_request_with_spinner("get", status_url)
+                    response.raise_for_status()
+                    data = response.json()
+                    node_data = data.get("data", {})
+
+                    # Some Proxmox versions include IP in status
+                    if "ip" in node_data:
+                        ip = node_data["ip"]
+                        if ip not in node_ips:
+                            node_ips.append(ip)
+                except requests.exceptions.RequestException:
+                    pass  # Skip this node if we can't get IP
+
+        return node_ips
+
+    def cache_password_override(
+        self, vm_node: str, vm_id: str, username: str, password: str
+    ) -> None:
+        """Store a one-time password override for a VM credential."""
+
+        key = (vm_node, str(vm_id), username or "")
+        self._password_overrides[key] = password
+
+    @staticmethod
+    def notes_contains_unencrypted_passwords(notes: str) -> bool:
+        """Return True if notes contain unencrypted password patterns (pass: or password:) without an encrypted_password: entry."""
+        if not notes:
+            return False
+        lower = notes.lower()
+        if "encrypted_password:" in lower:
+            return False
+
+        m = re.search(r'(?:pass|password):\s*["\']?([^"\';\s]+)', notes, re.IGNORECASE)
+        return bool(m)
+
+    def get_vms(self, node: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get list of VMs from all nodes or specific node"""
+        all_vms: List[Dict[str, Any]] = []
+
+        if node:
+            nodes = [{"node": node}]
+        else:
+            nodes = self.get_nodes()
+
+        for node_info in nodes:
+            node_name = node_info["node"]
+            vms_url = f"{self.config.proxmox_base_url}/nodes/{node_name}/qemu"
+
+            try:
+                response = self._make_request_with_spinner("get", vms_url)
+                response.raise_for_status()
+                data = response.json()
+                vms = data.get("data", [])
+
+                # Add node information to each VM
+                for vm in vms:
+                    vm["node"] = node_name
+
+                all_vms.extend(vms)
+            except requests.exceptions.RequestException as e:
+                print(f"Failed to get VMs from node {node_name}: {e}")
+
+        return all_vms
+
+    def get_vm_config(self, node: str, vmid: int) -> Dict[str, Any]:
+        """Get VM configuration including network information"""
+        config_url = f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/config"
+
+        try:
+            response = self._make_request_with_spinner("get", config_url)
+            response.raise_for_status()
+            data = response.json()
+            return cast(Dict[str, Any], data.get("data", {}))
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to get VM config: {e}")
+            return {}
+
+    def update_vm_notes(self, node: str, vmid: int, notes: str) -> bool:
+        """Update VM notes in Proxmox"""
+        config_url = f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/config"
+
+        try:
+            data: Dict[str, str] = {"description": notes}
+            response = self._make_request_with_spinner("put", config_url, data=data)
+            if response.status_code in (200, 204):
+                console.print(
+                    f"[green]Updated VM {vmid} notes with encrypted passwords[/green]"
+                )
+                return True
+            if response.status_code == 405:
+                # Some proxies disallow PUT - try POST with override
+                try:
+                    console.print(
+                        f"[yellow]PUT rejected for {config_url} (405). Trying POST override...[/yellow]"
+                    )
+                    headers = {"X-HTTP-Method-Override": "PUT"}
+                    r = self._make_request_with_spinner(
+                        "post", config_url, data=data, headers=headers
+                    )
+                    if r.status_code in (200, 201, 204):
+                        console.print(
+                            f"[green]Updated VM {vmid} notes via POST override[/green]"
+                        )
+                        return True
+                    r2 = self._make_request_with_spinner(
+                        "post", f"{config_url}?_method=PUT", data=data
+                    )
+                    if r2.status_code in (200, 201, 204):
+                        console.print(
+                            f"[green]Updated VM {vmid} notes via POST?_method=PUT[/green]"
+                        )
+                        return True
+                    console.print(
+                        Panel(
+                            f"Failed to update VM notes via override: {r.status_code}\n{r.text}",
+                            title="VM note update failed",
+                            border_style="red",
+                        )
+                    )
+                    return False
+                except requests.exceptions.RequestException as e:
+                    console.print(
+                        Panel(
+                            f"Failed to update VM notes via override: {e}",
+                            title="VM note update failed",
+                            border_style="red",
+                        )
+                    )
+                    return False
+            else:
+                console.print(
+                    Panel(
+                        f"Failed to update VM notes: {response.status_code}\n{response.text}",
+                        title="VM note update failed",
+                        border_style="red",
+                    )
+                )
+                return False
+        except requests.exceptions.RequestException as e:
+            console.print(
+                Panel(
+                    f"Failed to update VM notes: {e}",
+                    title="VM note update failed",
+                    border_style="red",
+                )
+            )
+            return False
+
+    def get_vm_notes(self, node: str, vmid: int) -> str:
+        """Get VM notes/description and automatically encrypt passwords if needed"""
+        config = self.get_vm_config(node, vmid)
+        # Notes can be in 'description' or 'notes' field, and may be URL-encoded
+        notes = config.get("description", "") or config.get("notes", "")
+
+        if notes:
+            # URL-decode the notes (Proxmox often URL-encodes them)
+            try:
+                from urllib.parse import unquote
+
+                notes = unquote(notes)
+            except Exception:
+                pass  # If decoding fails, use original
+
+        # Process notes to encrypt passwords and update VM if needed
+        if notes:
+            notes = self.process_and_update_vm_notes(node, vmid, notes)
+
+        return cast(str, notes)
+
+    def parse_credentials_from_notes(
+        self,
+        notes: str,
+        vm_name: str = "",
+        vm_id: str = "unknown",
+        vm_node: str = "unknown",
+        vm_ip: str = "unknown",
+        prompt_on_decrypt_failure: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Parse user credentials from VM notes - one-line format only"""
+        credentials: List[Dict[str, Any]] = []
+
+        if not notes:
+            return credentials
+
+        # Get additional variables for templates (passed as parameters)
+        hostname = socket.gethostname().split(".")[0]  # Local hostname
+
+        # New flexible format: Parameters can be in any order, multiple protocols per user
+        # Example: user:"admin" pass:"pass123" protos:"rdp,vnc,ssh" rdp_port:"3389" vnc_port:"5901" ssh_port:"22" confName:"template" wolDisabled:"true";
+        # Find lines ending with semicolon (credential lines)
+        credential_lines = re.findall(r"[^;]*;", notes, re.MULTILINE)
+
+        # Also look for default template (handle various formats)
+        default_template_pattern = r'default_conf_name:\s*["\']([^"\']+)["\']'
+        default_template = None
+        default_match = re.search(default_template_pattern, notes, re.IGNORECASE)
+        if default_match:
+            default_template = default_match.group(1).strip()
+
+        # Filter out non-credential lines (like default_conf_name)
+        credential_lines = [
+            line
+            for line in credential_lines
+            if not line.strip().startswith("default_conf_name")
+        ]
+
+        # Process each credential line
+        for line in credential_lines:
+            line = line.strip()
+            if not line or line == ";":
+                continue
+
+            # Parse key-value pairs from the line
+            params = self._parse_credential_line(line)
+            if not params:
+                print(f"  No parameters parsed from line: {line}")
+                continue
+
+            # Handle malformed lines where encrypted_password got concatenated with confName
+            if "confName" in params and "encrypted_password:" in params["confName"]:
+                confname_value = params["confName"]
+                if " encrypted_password:" in confname_value:
+                    # Split at the encrypted_password part
+                    parts = confname_value.split(" encrypted_password:", 1)
+                    if len(parts) == 2:
+                        params["confName"] = parts[0].strip()
+                        # The encrypted password might be at the end of the line
+                        # Look for it after the current confName value in the original line
+                        enc_pass_match = re.search(
+                            r'encrypted_password:["\']*([^"\';\s]+)', line
+                        )
+                        if enc_pass_match:
+                            params["encrypted_password"] = enc_pass_match.group(1)
+
+            # Extract required parameters with fallbacks (support both new and old names)
+            username = params.get("username", params.get("user", "")).strip()
+            password: Optional[str] = params.get("password", params.get("pass", "")).strip()
+            encrypted_password = params.get("encrypted_password", "").strip()
+            protocols_str = params.get(
+                "protocols", params.get("protos", params.get("proto", ""))
+            ).strip()
+
+            # Handle password decryption if encrypted
+            if encrypted_password and not password:
+                override_key = (vm_node, str(vm_id), username or "")
+                override_password = self._password_overrides.pop(
+                    override_key, None
+                )
+                if override_password:
+                    password = override_password
+                    params["password"] = override_password
+                    params.pop("encrypted_password", None)
+                else:
+                    try:
+                        password = self._decrypt_password(encrypted_password)
+                    except PasswordDecryptionError as decrypt_error:
+                        if prompt_on_decrypt_failure:
+                            password = self.prompt_password_reentry(
+                                decrypt_error,
+                                username=username,
+                                vm_name=vm_name,
+                                vm_id=vm_id,
+                                vm_node=vm_node,
+                            )
+                            if password:
+                                params["password"] = password
+                                params.pop("encrypted_password", None)
+                            else:
+                                print(
+                                    f"  Skipping credential for user {username or '<unknown>'} due to unrecoverable password."
+                                )
+                                continue
+                        else:
+                            raise CredentialRecoveryPending(
+                                decrypt_error,
+                                username=username,
+                                vm_name=vm_name,
+                                vm_id=str(vm_id),
+                                vm_node=vm_node,
+                                params=params,
+                                raw_line=line,
+                            )
+
+            # More detailed error reporting for missing fields
+            missing_fields: List[str] = []
+            if not username:
+                missing_fields.append("username")
+            if not password and not encrypted_password:
+                missing_fields.append("password")
+            if not protocols_str:
+                missing_fields.append("protocols")
+
+            if missing_fields:
+                print(
+                    f"  Skipping credential line (missing: {', '.join(missing_fields)})"
+                )
+                print(f"    Parsed params: {params}")
+                print(f"    Original line: {line}")
+                continue
+
+            # Parse protocols (can be comma-separated)
+            protocols = [
+                p.strip().lower() for p in protocols_str.split(",") if p.strip()
+            ]
+
+            # Validate protocols
+            valid_protocols: List[str] = []
+            for proto in protocols:
+                if proto in ["rdp", "vnc", "ssh"]:
+                    valid_protocols.append(proto)
+                else:
+                    print(
+                        f"Warning: Unsupported protocol '{proto}' for user {username}. Skipping protocol."
+                    )
+
+            if not valid_protocols:
+                print(
+                    f"Warning: No valid protocols found for user {username}. Skipping."
+                )
+                continue
+
+            # Create connections for each protocol
+            for protocol in valid_protocols:
+                # Get protocol-specific port with fallbacks
+                port_key = f"{protocol}_port"
+                if protocol == "rdp":
+                    default_port = 3389
+                elif protocol == "ssh":
+                    default_port = 22
+                else:  # vnc
+                    default_port = 5900
+
+                port = int(params.get(port_key, params.get("port", default_port)))
+
+                # Parse RDP settings if provided (support both new and old names)
+                rdp_overrides = {}
+                rdp_settings = params.get("rdp_settings", params.get("rdpSettings", ""))
+                if rdp_settings and protocol == "rdp":
+                    for setting in rdp_settings.split(","):
+                        if "=" in setting:
+                            key, value = setting.split("=", 1)
+                            rdp_overrides[key.strip()] = value.strip()
+
+                # Parse VNC settings if provided (support both new and old names)
+                vnc_overrides = {}
+                vnc_settings = params.get("vnc_settings", params.get("vncSettings", ""))
+                if vnc_settings and protocol == "vnc":
+                    for setting in vnc_settings.split(","):
+                        if "=" in setting:
+                            key, value = setting.split("=", 1)
+                            vnc_overrides[key.strip()] = value.strip()
+
+                # Parse WoL settings if provided (support both new and old names)
+                wol_overrides = {}
+                wol_settings = params.get("wol_settings", params.get("wolSettings", ""))
+                if wol_settings:
+                    for setting in wol_settings.split(","):
+                        if "=" in setting:
+                            key, value = setting.split("=", 1)
+                            wol_overrides[key.strip()] = value.strip()
+
+                # Check if WoL is disabled for this connection (support both new and old names)
+                wol_disabled_str = params.get(
+                    "wol_disabled", params.get("wolDisabled", "false")
+                ).lower()
+                wol_disabled = wol_disabled_str in ["true", "1", "yes"]
+
+                # Determine connection name template (support both new and old names)
+                custom_name = params.get("connection_name", params.get("confName"))
+                if custom_name:
+                    template = custom_name
+                elif default_template:
+                    template = default_template
+                else:
+                    template = "{user}@{vmname}-{proto}"  # Default fallback
+
+                # Process all available placeholders
+                placeholders: Dict[str, Optional[str]] = {
+                    "vmname": vm_name,
+                    "user": username,
+                    "username": username,
+                    "password": password,
+                    "proto": protocol,
+                    "protocol": protocol,
+                    "vmid": str(vm_id),
+                    "vm_id": str(vm_id),
+                    "node": vm_node,
+                    "vmnode": vm_node,
+                    "vm_node": vm_node,
+                    "ip": vm_ip,
+                    "vmip": vm_ip,
+                    "vm_ip": vm_ip,
+                    "hostname": hostname,
+                    "host": hostname,
+                    "port": str(port),
+                }
+
+                # Replace placeholders in template
+                connection_name = template
+                for key, value in placeholders.items():
+                    connection_name = connection_name.replace(
+                        "{" + key + "}", str(value)
+                    )
+
+                credentials.append(
+                    {
+                        "username": username,
+                        "password": password,
+                        "protocol": protocol,
+                        "connection_name": connection_name,
+                        "port": port,
+                        "rdp_settings": rdp_overrides,
+                        "vnc_settings": vnc_overrides,
+                        "wol_settings": wol_overrides,
+                        "wol_disabled": wol_disabled,
+                    }
+                )
+
+        return credentials
+
+    def has_structured_credentials(self, notes: str) -> bool:
+        """Return True if notes contain at least one properly structured credential line.
+
+        A structured credential line is defined as a line ending with ';' that contains
+        at minimum one of user:/username: plus pass:/password: (or encrypted_password:)
+        and a protocols/protos/proto field. Legacy lines like 'user:pass' without a
+        terminating semicolon MUST NOT be treated as structured credentials.
+        """
+        if not notes:
+            return False
+        # Fast fail: need a semicolon to be considered structured
+        if ";" not in notes:
+            return False
+        # Re-use existing parser logic: if any credential objects return, we have structured lines
+        parsed = self.parse_credentials_from_notes(notes)
+        return len(parsed) > 0
+
+    @staticmethod
+    def _parse_credential_line(line: str) -> Dict[str, str]:
+        """Parse a credential line with flexible parameter order"""
+        params: Dict[str, str] = {}
+
+        # Remove trailing semicolon and whitespace
+        line = line.rstrip(";").strip()
+
+        # Enhanced pattern to handle quoted values with embedded colons and parameters
+        # This pattern is more careful about matching quoted strings that may contain colons
+        param_pattern = r'(\w+):\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s;"\']+))'
+
+        matches = re.finditer(param_pattern, line)
+        for match in matches:
+            key = match.group(1).strip()
+            # Use the appropriate captured group (quoted or unquoted)
+            value = match.group(2) or match.group(3) or match.group(4)
+            if value:
+                params[key] = value.strip()
+
+        return params
+
+    def _get_encryption_key(self) -> Optional[bytes]:
+        """Get or generate encryption key from config"""
+        encryption_key = getattr(self.config, "ENCRYPTION_KEY", None)
+        if not encryption_key:
+            print(
+                "Warning: No encryption key found in config. Passwords will not be encrypted."
+            )
+            return None
+
+        # Convert string key to bytes and derive a proper 32-byte key
+        key_bytes = encryption_key.encode("utf-8")
+        return base64.urlsafe_b64encode(hashlib.sha256(key_bytes).digest())
+
+    def _encrypt_password(self, password: str) -> str:
+        """Encrypt a password using Fernet encryption"""
+        try:
+            key = self._get_encryption_key()
+            if not key:
+                return password  # Return plain if no key
+
+            fernet = Fernet(key)
+            encrypted = fernet.encrypt(password.encode("utf-8"))
+            return base64.urlsafe_b64encode(encrypted).decode("utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to encrypt password: {e}")
+            return password
+
+    def _decrypt_password(self, encrypted_password: str) -> str:
+        """Decrypt a password using Fernet encryption or raise a detailed error."""
+        key = self._get_encryption_key()
+        if not key:
+            raise PasswordDecryptionError(
+                "No encryption key configured for decrypting VM credentials.",
+                encrypted_password,
+                details=(
+                    "Set Config.ENCRYPTION_KEY to the same value that was used when the credentials were encrypted."
+                ),
+            )
+
+        try:
+            fernet = Fernet(key)
+            encrypted_bytes = base64.urlsafe_b64decode(
+                encrypted_password.encode("utf-8")
+            )
+            decrypted = fernet.decrypt(encrypted_bytes)
+            return decrypted.decode("utf-8")
+        except InvalidToken as err:
+            raise PasswordDecryptionError(
+                "Encrypted password could not be decrypted with the configured key.",
+                encrypted_password,
+                details=(
+                    "The stored ciphertext is valid Fernet data, but the key likely changed or the data belongs to another environment."
+                ),
+                root_cause=err,
+            ) from err
+        except Exception as err:  # pragma: no cover - defensive branch
+            raise PasswordDecryptionError(
+                "Unexpected error while decrypting the stored password.",
+                encrypted_password,
+                details=str(err),
+                root_cause=err,
+            ) from err
+
+    def prompt_password_reentry(
+        self,
+        error: PasswordDecryptionError,
+        username: str,
+        vm_name: str,
+        vm_id: str,
+        vm_node: str,
+    ) -> Optional[str]:
+        """Display diagnostics for a decryption failure and optionally prompt for a new password."""
+
+        user_label = username or "<missing>"
+        vm_label = vm_name or f"VMID {vm_id}"
+        header = f"Stored password decryption failed for user '{user_label}'."
+        diagnostics = error.format_diagnostics()
+
+        console.print(
+            Panel(
+                f"{header}\n\nTarget VM: {vm_label} (VMID {vm_id} on {vm_node})\n\n{diagnostics}",
+                title="Password recovery required",
+                border_style="red",
+            )
+        )
+
+        if not sys.stdin.isatty():
+            console.print(
+                "[yellow]Skipping interactive password entry because the session is non-interactive."
+                " Run 'guac_vm_manager.py repair --vm-filter "
+                f"{vm_id}' from a terminal to fix this credential.[/yellow]"
+            )
+            return None
+
+        try:
+            new_password = console.input(
+                "Enter the correct password now (leave blank to skip): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("[yellow]Password entry cancelled by user.[/yellow]")
+            return None
+
+        if not new_password:
+            console.print(
+                "[yellow]No password provided. The credential will be skipped for this run."
+                "[/yellow]"
+            )
+            return None
+
+        console.print(
+            "[green]Received replacement password. It will be used immediately and re-encrypted after sync.[/green]"
+        )
+        return new_password
+
+    def encrypt_credentials_in_notes(self, notes: str) -> str:
+        """Encrypt all passwords in VM notes and return updated notes"""
+        if not notes:
+            return notes
+
+        lines = notes.split("\n")
+        updated_lines: List[str] = []
+        changes_made = False
+
+        for line in lines:
+            if ";" in line and ("password:" in line.lower() or "pass:" in line.lower()):
+                # Parse and encrypt passwords in this line
+                params = self._parse_credential_line(
+                    line + ";" if not line.endswith(";") else line
+                )
+                if params:
+                    password = params.get("password", params.get("pass", ""))
+                    if password and "encrypted_password" not in params:
+                        encrypted = self._encrypt_password(password)
+                        if encrypted:
+
+                            if f'pass:"{password}"' in line:
+                                line = line.replace(
+                                    f'pass:"{password}"',
+                                    f'encrypted_password:"{encrypted}"',
+                                )
+                                changes_made = True
+                            elif f'password:"{password}"' in line:
+                                line = line.replace(
+                                    f'password:"{password}"',
+                                    f'encrypted_password:"{encrypted}"',
+                                )
+                                changes_made = True
+
+            updated_lines.append(line)
+
+        if changes_made:
+            print("Converted plain passwords to encrypted format in VM notes")
+
+        return "\n".join(updated_lines)
+
+    def process_and_update_vm_notes(self, node: str, vmid: int, notes: str) -> str:
+        """
+        Process VM notes to encrypt passwords and update VM if changes are made.
+        Returns the processed notes string.
+        """
+
+        if not notes:
+            return notes
+
+        original_notes = notes
+        updated_notes = notes
+        changes_made = False
+
+        # Process each line for password encryption
+        lines = notes.split("\n")
+        updated_lines: List[str] = []
+
+        for line in lines:
+            # Check if line contains credentials
+            if ";" in line and any(
+                param in line.lower()
+                for param in ["user:", "pass:", "encrypted_password:"]
+            ):
+                params = self._parse_credential_line(line)
+                if params:
+                    plain_password = params.get("password", params.get("pass", ""))
+                    encrypted_password = params.get("encrypted_password", "")
+
+                    # Case 1: Has plain password but no encrypted password -> encrypt and replace
+                    if plain_password and not encrypted_password:
+                        encrypted = self._encrypt_password(plain_password)
+                        if encrypted:
+                            # Remove plain password and add encrypted password
+                            new_line = line
+                            # Remove password field (both formats)
+                            new_line = re.sub(r'\bpass:"[^"]*"', "", new_line)
+                            new_line = re.sub(r'\bpassword:"[^"]*"', "", new_line)
+                            # Clean up extra spaces
+                            new_line = re.sub(r"\s+", " ", new_line).strip()
+                            # Add encrypted password before the semicolon
+                            new_line = (
+                                new_line.rstrip(";").strip()
+                                + f' encrypted_password:"{encrypted}";'
+                            )
+                            line = new_line
+                            changes_made = True
+                            print(f"Encrypted password for VM {vmid}")
+
+                    # Case 2: Has both plain and encrypted password -> check if they match
+                    elif plain_password and encrypted_password:
+                        try:
+                            decrypted = self._decrypt_password(encrypted_password)
+                        except PasswordDecryptionError as decrypt_error:
+                            console.print(
+                                Panel(
+                                    "Stored encrypted password could not be verified while reconciling VM notes."
+                                    f" A new ciphertext will be written.\n\n{decrypt_error.format_diagnostics()}",
+                                    title=f"VM {vmid} credential mismatch",
+                                    border_style="yellow",
+                                )
+                            )
+                            decrypted = None
+
+                        if decrypted != plain_password:
+                            # Password changed - update encrypted password
+                            new_encrypted = self._encrypt_password(plain_password)
+                            if new_encrypted:
+                                # Replace the encrypted password
+                                new_line = re.sub(
+                                    r'encrypted_password:"[^"]*"',
+                                    f'encrypted_password:"{new_encrypted}"',
+                                    line,
+                                )
+                                # Remove plain password
+                                new_line = re.sub(r'\bpass:"[^"]*"', "", new_line)
+                                new_line = re.sub(r'\bpassword:"[^"]*"', "", new_line)
+                                # Clean up extra spaces
+                                new_line = re.sub(r"\s+", " ", new_line).strip()
+                                line = new_line
+                                changes_made = True
+                                print(
+                                    f"Updated encrypted password for VM {vmid} (password changed)"
+                                )
+
+                    # Case 3: Only encrypted password -> leave as is (this is the desired state)
+
+            updated_lines.append(line)
+
+        updated_notes = "\n".join(updated_lines)
+
+        # If changes were made, update the VM notes in Proxmox
+        if changes_made and updated_notes != original_notes:
+            if self.update_vm_notes(node, vmid, updated_notes):
+                print(f"Successfully updated VM {vmid} notes with encrypted passwords")
+            else:
+                print(f"Warning: Failed to update VM {vmid} notes in Proxmox")
+                return original_notes  # Return original if update failed
+
+        return updated_notes
+
+    def get_vm_agent_network(self, node: str, vmid: int) -> List[Dict[str, Any]]:
+        """Fetch network information via QEMU guest agent if available"""
+        agent_url = f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+        try:
+            # Use GET and include X-Requested-With to mirror the browser/UI request
+            headers = {"X-Requested-With": "XMLHttpRequest"}
+            response = self._make_request_with_spinner(
+                "get", agent_url, headers=headers, timeout=10
+            )
+            if response.status_code != 200:
+                # Provide richer diagnostic output for failed guest agent queries
+                resp_text = "<no body>"
+                try:
+                    resp_text = response.text
+                except Exception:
+                    pass
+                print(
+                    f" Guest agent query returned status {response.status_code} for VM {vmid}: {resp_text}"
+                )
+
+                # Common cause: guest agent not available or VM type doesn't support this endpoint
+                if response.status_code == 501:
+                    print(
+                        "  Guest agent endpoint not implemented (501).\n"
+                        "  If this is a QEMU VM with qemu-guest-agent installed, ensure the agent is running inside the VM and that Proxmox has guest agent support enabled.\n"
+                        "  For LXC containers, the guest agent endpoints differ and may not be available via this path.\n"
+                    )
+                return []
+            data = response.json()
+            result: Dict[str, Any] = data.get("data", {})
+            # Some responses wrap in {'result': [...]} while older return list directly
+            interfaces: Any = result.get("result") if "result" in result else result
+            if not isinstance(interfaces, list):
+                print(
+                    f" Guest agent returned non-list data for VM {vmid}: {type(interfaces)}"
+                )
+                return []
+
+            # Debug: show what we got from guest agent
+            valid_interfaces: List[Dict[str, Any]] = []
+            for iface in interfaces:  # type: ignore
+                iface = cast(Dict[str, Any], iface)
+                name: str = iface.get("name", "unknown")
+                mac: str = iface.get("hardware-address", "no-mac")
+                ip_count = len(iface.get("ip-addresses", []))
+
+                # Skip loopback interfaces
+                if "loopback" in name.lower() or "pseudo-interface" in name.lower():
+                    continue
+
+                print(f" Guest agent interface: {name} (MAC: {mac}, {ip_count} IPs)")
+                valid_interfaces.append(iface)
+
+            return valid_interfaces
+        except requests.exceptions.RequestException as e:
+            print(f"Warning: Guest agent network query failed for VM {vmid}: {e}")
+            return []
+
+    def get_vm_status(self, node: str, vmid: int) -> Dict[str, Any]:
+        """Get VM status information"""
+        status_url = (
+            f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/status/current"
+        )
+
+        try:
+            response = self._make_request_with_spinner("get", status_url)
+            response.raise_for_status()
+            data = response.json()
+            return cast(Dict[str, Any], data.get("data", {}))
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to get VM status: {e}")
+            return {}
+
+    def start_vm(self, node: str, vmid: int) -> bool:
+        """Start a VM"""
+        start_url = (
+            f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/status/start"
+        )
+
+        try:
+            response = self.session.post(start_url)
+            response.raise_for_status()
+            print(f"Started VM {vmid} on node {node}")
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to start VM {vmid}: {e}")
+            return False
+
+    def stop_vm(self, node: str, vmid: int) -> bool:
+        """Stop a VM"""
+        stop_url = (
+            f"{self.config.proxmox_base_url}/nodes/{node}/qemu/{vmid}/status/stop"
+        )
+
+        try:
+            response = self.session.post(stop_url)
+            response.raise_for_status()
+            print(f"Stopped VM {vmid} on node {node}")
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Failed to stop VM {vmid}: {e}")
+            return False
+
+    def get_vm_network_info(self, node: str, vmid: int) -> List[Dict[str, Any]]:
+        """Extract network interface information including MAC and IP details"""
+        config = self.get_vm_config(node, vmid)
+        network_interfaces: List[Dict[str, Any]] = []
+
+        # Parse static config (net0, net1, ...)
+        for key, value in config.items():
+            if key.startswith("net") and isinstance(value, str):
+                net_info: Dict[str, Optional[str]] = {
+                    "interface": key,
+                    "mac": None,
+                    "model": None,
+                    "bridge": None,
+                    "tag": None,
+                }
+
+                parts = value.split(",")
+                for part in parts:
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        net_info[k] = v
+                        # Also check if this is a MAC address
+                        if ":" in v and len(v.split(":")) == 6:
+                            net_info["mac"] = v
+                    else:
+                        candidate = part.strip()
+                        if ":" in candidate and len(candidate.split(":")) == 6:
+                            net_info["mac"] = candidate
+                        else:
+                            net_info["model"] = candidate
+
+                network_interfaces.append(net_info)
+
+        # Attempt to enrich with guest agent data for live IPs
+        agent_interfaces = self.get_vm_agent_network(node, vmid)
+        agent_by_mac: Dict[str, Dict[str, Any]] = {}
+        for iface in agent_interfaces:
+            hardware_mac = iface.get("hardware-address")
+            if not hardware_mac:
+                continue
+            ips: List[Dict[str, Any]] = []
+            for addr in iface.get("ip-addresses", []):
+                ip_address = addr.get("ip-address")
+                # Skip link-local, loopback, and IPv6 addresses
+                if not ip_address:
+                    continue
+                if ip_address.startswith("127.") or ip_address.startswith("::1"):
+                    continue
+                # Skip all IPv6 addresses
+                if "::" in ip_address or (":" in ip_address and "." not in ip_address):
+                    continue
+                ips.append({"address": ip_address, "prefix": addr.get("prefix")})
+            agent_by_mac[hardware_mac.lower()] = {"name": iface.get("name"), "ips": ips}
+
+        enriched_interfaces: List[Dict[str, Any]] = []
+        seen_macs: Set[str] = set()
+        for net in network_interfaces:
+            mac = (net.get("mac") or "").lower() if net.get("mac") else ""
+            if mac in agent_by_mac:
+                net["ip_addresses"] = agent_by_mac[mac]["ips"]
+                net["guest_interface"] = agent_by_mac[mac]["name"]
+            else:
+                net["ip_addresses"] = []
+            if mac:
+                seen_macs.add(mac)
+            enriched_interfaces.append(net)
+
+        # Include any agent interfaces not present in config (e.g., hotplugged)
+        for mac, details in agent_by_mac.items():
+            if mac in seen_macs:
+                continue
+            enriched_interfaces.append(
+                {
+                    "interface": details.get("name"),
+                    "mac": mac,
+                    "model": "agent",
+                    "bridge": None,
+                    "tag": None,
+                    "ip_addresses": details.get("ips", []),
+                    "guest_interface": details.get("name"),
+                }
+            )
+
+        return enriched_interfaces
+
+
+class NetworkScanner:
+    """Network scanning functionality to find MAC addresses"""
+
+    @staticmethod
+    def get_local_network_range() -> Optional[str]:
+        """Get the local network range (e.g., 192.168.1.0/24) - Cross-platform"""
+        try:
+            system = platform.system().lower()
+            
+            if system == "windows":
+                # Windows: use route print to find default gateway
+                result = subprocess.run(
+                    ["route", "print", "0.0.0.0"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                # Look for active routes with gateway
+                for line in result.stdout.split('\n'):
+                    if '0.0.0.0' in line and '0.0.0.0' in line:
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            gateway = parts[2]
+                            if re.match(r'\d+\.\d+\.\d+\.\d+', gateway):
+                                network_parts = gateway.split(".")
+                                network_base = ".".join(network_parts[:3]) + ".0/24"
+                                return network_base
+            
+            elif system == "darwin":
+                # macOS: use route -n get default
+                result = subprocess.run(
+                    ["route", "-n", "get", "default"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                gateway_match = re.search(r"gateway: (\d+\.\d+\.\d+\.\d+)", result.stdout)
+                if gateway_match:
+                    gateway = gateway_match.group(1)
+                    network_parts = gateway.split(".")
+                    network_base = ".".join(network_parts[:3]) + ".0/24"
+                    return network_base
+            
+            else:
+                # Linux: use ip route or route -n
+                try:
+                    result = subprocess.run(
+                        ["ip", "route", "show", "default"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=True,
+                    )
+                    gateway_match = re.search(r"via (\d+\.\d+\.\d+\.\d+)", result.stdout)
+                    if gateway_match:
+                        gateway = gateway_match.group(1)
+                        network_parts = gateway.split(".")
+                        network_base = ".".join(network_parts[:3]) + ".0/24"
+                        return network_base
+                except subprocess.CalledProcessError:
+                    # Fallback to route -n for older systems
+                    result = subprocess.run(
+                        ["route", "-n"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=True,
+                    )
+                    for line in result.stdout.split('\n'):
+                        if line.startswith('0.0.0.0'):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                gateway = parts[1]
+                                if re.match(r'\d+\.\d+\.\d+\.\d+', gateway):
+                                    network_parts = gateway.split(".")
+                                    network_base = ".".join(network_parts[:3]) + ".0/24"
+                                    return network_base
+            
+            return None
+        except Exception as e:
+            print(f"Warning: Could not determine local network range: {e}")
+            return None
+
+    @staticmethod
+    def scan_arp_table(target_mac: Optional[str] = None) -> List[Dict[str, str]]:
+        """Scan ARP table for MAC addresses"""
+        arp_entries: List[Dict[str, str]] = []
+        try:
+            system = platform.system().lower()
+            
+            # Use appropriate arp command for each platform
+            if system == "windows":
+                result = subprocess.run(
+                    ["arp", "-a"], capture_output=True, text=True, timeout=3, check=True
+                )
+            else:
+                # Unix-like systems (macOS/Linux) - try -an first for numeric output
+                try:
+                    result = subprocess.run(
+                        ["arp", "-an"], capture_output=True, text=True, timeout=2, check=True
+                    )
+                except subprocess.CalledProcessError:
+                    # Fallback to regular arp -a
+                    result = subprocess.run(
+                        ["arp", "-a"], capture_output=True, text=True, timeout=3, check=True
+                    )
+
+            for line in result.stdout.split("\n"):
+                # Parse ARP entries - handle multiple formats:
+                # Unix Format 1: host (192.168.1.1) at aa:bb:cc:dd:ee:ff [ether] on en0
+                # Unix Format 2: ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0
+                # Windows Format: 192.168.1.1         aa-bb-cc-dd-ee-ff     dynamic
+                
+                ip, mac, hostname = None, None, None
+                
+                if system == "windows":
+                    # Windows: "  192.168.178.1         d4-24-dd-53-bf-cd     dynamic"
+                    match = re.search(
+                        r"(\d+\.\d+\.\d+\.\d+)\s+([a-fA-F0-9-]{17})\s+\w+", line
+                    )
+                    if match:
+                        ip, mac = match.groups()
+                        mac = mac.replace("-", ":")  # Convert Windows format to Unix format
+                        hostname = "unknown"
+                else:
+                    # Unix format
+                    match = re.search(
+                        r"(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([a-fA-F0-9:]+)", line
+                    )
+                    if match:
+                        hostname, ip, mac = match.groups()
+                
+                if ip and mac:
+
+                    # Validate MAC address format (should be exactly 6 groups of 2 hex chars)
+                    mac_parts = mac.lower().split(":")
+                    if len(mac_parts) != 6:
+                        continue  # Skip invalid MAC formats
+
+                    # Normalize MAC address - ensure consistent format with leading zeros
+                    try:
+                        mac_normalized = ":".join(part.zfill(2) for part in mac_parts)
+                        # Validate each part is valid hex
+                        for part in mac_parts:
+                            int(part, 16)
+                    except ValueError:
+                        continue  # Skip invalid hex in MAC
+
+                    entry: Dict[str, str] = {
+                        "hostname": str(hostname if hostname != "?" else ip),
+                        "ip": str(ip),
+                        "mac": mac_normalized,
+                    }
+
+                    # If looking for specific MAC, check match with detailed debugging
+                    if target_mac:
+                        target_parts = target_mac.lower().replace("-", ":").split(":")
+                        target_normalized = ":".join(
+                            part.zfill(2) for part in target_parts
+                        )
+
+                        if mac_normalized == target_normalized:
+                            print(
+                                f" MAC match found: {target_normalized} -> {ip} ({hostname})"
+                            )
+                            return [entry]  # Return immediately if found
+                        # Don't spam debug output for non-matches in normal operation
+                    else:
+                        # Only add to entries if we're not looking for a specific MAC
+                        arp_entries.append(entry)
+
+        except Exception as e:
+            print(f"Warning: Could not scan ARP table: {e}")
+
+        # If looking for specific MAC and we reach here, it wasn't found
+        if target_mac:
+            return []
+
+        return arp_entries
+
+    @staticmethod
+    def ping_sweep_network(network_range: str) -> None:
+        """Ping sweep to populate ARP table"""
+        try:
+            network = ipaddress.IPv4Network(network_range, strict=False)
+            print(f"Scanning network {network_range} to populate ARP table...")
+
+            # Ping a range of IPs to populate ARP table
+            processes: List[subprocess.Popen[Any]] = []
+            for ip in list(network.hosts())[:50]:  # Limit to first 50 hosts
+                try:
+                    proc = subprocess.Popen(
+                        ["ping", "-c", "1", "-W", "1000", str(ip)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    processes.append(proc)
+                except Exception:
+                    continue
+
+            # Wait for pings to complete
+            for proc in processes:
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+            print("Network scan completed")
+
+        except Exception as e:
+            print(f"Warning: Network ping sweep failed: {e}")
+
+    @staticmethod
+    def find_mac_on_network(target_mac: str) -> Optional[Dict[str, str]]:
+        """Find a specific MAC address on the local network"""
+        print(f" Searching for MAC address {target_mac} on local network...")
+
+        # First check ARP table
+        entries = NetworkScanner.scan_arp_table(target_mac)
+        if entries:
+            entry = entries[0]
+            print(
+                f" Found MAC {target_mac} at IP {entry['ip']} (hostname: {entry['hostname']})"
+            )
+            return entry
+
+        print(f" MAC {target_mac} not in current ARP table, trying network sweep...")
+
+        # If not found, do network sweep and try again
+        network_range = NetworkScanner.get_local_network_range()
+        if network_range:
+            NetworkScanner.ping_sweep_network(network_range)
+
+            # Check ARP table again after sweep
+            entries = NetworkScanner.scan_arp_table(target_mac)
+            if entries:
+                entry = entries[0]
+                print(
+                    f" Found MAC {target_mac} at IP {entry['ip']} after network sweep"
+                )
+                return entry
+
+        print(f" MAC address {target_mac} not found on local network")
+        print("   This could mean:")
+        print("   - VM is stopped or not responding to network traffic")
+        print("   - VM is on a different network segment")
+        print("   - MAC address in Proxmox config doesn't match actual VM")
+        return None
+
+    @staticmethod
+    def find_mac_by_ip(target_ip: str) -> Optional[str]:
+        """Attempt to resolve MAC address for a given IPv4 via ARP (ping first if needed)."""
+        try:
+            # First try ARP table directly
+            entries = NetworkScanner.scan_arp_table()
+            for e in entries:
+                if e.get("ip") == target_ip:
+                    return e.get("mac")
+            # Ping target to populate ARP
+            subprocess.run(
+                ["ping", "-c", "1", "-W", "1000", target_ip],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=True,
+            )
+            entries = NetworkScanner.scan_arp_table()
+            for e in entries:
+                if e.get("ip") == target_ip:
+                    return e.get("mac")
+        except Exception:
+            return None
+        return None
+
+
+class WakeOnLan:
+    """Wake-on-LAN functionality"""
+
+    @staticmethod
+    def send_wol_packet(
+        mac_address: str, broadcast_ip: str = "255.255.255.255", port: int = 9
+    ) -> bool:
+        """Send Wake-on-LAN magic packet"""
+        try:
+            # Remove any separators from MAC address
+            mac_address = mac_address.replace(":", "").replace("-", "").replace(".", "")
+
+            if len(mac_address) != 12:
+                raise ValueError("MAC address must be 12 hex characters")
+
+            # Convert MAC address to bytes
+            mac_bytes = bytes.fromhex(mac_address)
+
+            # Create magic packet: 6 bytes of 0xFF followed by 16 repetitions of MAC address
+            magic_packet = b"\xff" * 6 + mac_bytes * 16
+
+            # Send packet
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.sendto(magic_packet, (broadcast_ip, port))
+            sock.close()
+
+            print(f"WoL packet sent to {mac_address} via {broadcast_ip}:{port}")
+            return True
+
+        except Exception as e:
+            print(f"Failed to send WoL packet: {e}")
+            return False
+
+    @staticmethod
+    def validate_mac_address(mac_address: str) -> bool:
+        """Validate MAC address format"""
+        # Remove separators
+        clean_mac = mac_address.replace(":", "").replace("-", "").replace(".", "")
+
+        # Check if it's 12 hex characters
+        if len(clean_mac) != 12:
+            return False
+
+        try:
+            int(clean_mac, 16)
+            return True
+        except ValueError:
+            return False
+
+
+def interactive_add_vm(
+    auto_approve: bool = False,
+    start_external: bool = False,
+    specific_vm_id: Optional[int] = None,
+    specific_node: Optional[str] = None,
+    override_hostname: Optional[str] = None,
+    override_protocol: Optional[str] = None,
+    override_port: Optional[int] = None,
+    override_wol: Optional[bool] = None,
+    override_mac: Optional[str] = None,
+    external_config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Interactive function to add a Proxmox VM or external host to Guacamole.
+
+    start_external: skip Proxmox listing and immediately configure an external host.
+    """
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+    proxmox_api = ProxmoxAPI(config)
+
+    # Initialize variables
+    selected_hostname: Optional[str] = None
+
+    console.print(
+        Panel.fit("[bold]Add Connection to Guacamole[/bold]", border_style="cyan")
+    )
+
+    # Authenticate with Guacamole
+    if not guac_api.authenticate():
+        print("Failed to authenticate with Guacamole")
+        return False
+
+    # Get VMs from Proxmox (skip if starting with external)
+    vms: List[Dict[str, Any]] = []
+    if not start_external:
+        # Authenticate with Proxmox first (consistent success panel)
+        if not proxmox_api.test_auth():
+            return False
+        console.print("\n[cyan]Fetching VMs from Proxmox...[/cyan]")
+        try:
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Loading VM list...", total=None)
+                vms = proxmox_api.get_vms()
+                progress.update(task, completed=True)
+        except Exception:
+            # Fallback without progress if Rich progress fails for any reason
+            vms = proxmox_api.get_vms()
+
+    if vms and not start_external:
+        # Get existing Guacamole connections to check which VMs are already configured
+        existing_connections = guac_api.get_connections()
+        existing_connection_names: Set[str] = set()
+        if existing_connections:
+            for conn in existing_connections.values():
+                existing_connection_names.add(conn.get("name", ""))
+
+        # Categorize VMs: those with credentials and unconfigured vs others
+        vms_with_unconfigured_creds: List[Dict[str, Any]] = []
+        vms_with_configured_creds: List[Dict[str, Any]] = []
+        vms_without_creds: List[Dict[str, Any]] = []
+
+        for vm in vms:
+            vm_id = vm.get("vmid")
+            vm_name = vm.get("name", "")
+            node_name = vm.get("node")
+
+            # Skip if essential VM info is missing
+            if not vm_id or not node_name or not isinstance(vm_id, int):
+                vms_without_creds.append(vm)
+                continue
+
+            # Check if VM has credentials in notes
+            try:
+                vm_config = proxmox_api.get_vm_config(node_name, vm_id)
+                notes = vm_config.get("description", "")
+                # Capture memory for later display (try common keys)
+                vm_mem = None
+                if vm_config.get("memory") is not None:
+                    # VM config memory is in MiB, convert to bytes for consistent storage
+                    vm_mem = int(vm_config["memory"]) * 1024 * 1024
+                elif vm_config.get("maxmem") is not None:
+                    vm_mem = vm_config["maxmem"]
+                elif vm.get("maxmem") is not None:
+                    vm_mem = vm.get("maxmem")
+                elif vm.get("mem") is not None:
+                    vm_mem = vm.get("mem")
+
+                if vm_mem is not None:
+                    vm["_memory"] = vm_mem
+
+                if notes:
+                    parsed_creds = proxmox_api.parse_credentials_from_notes(
+                        notes, vm_name, str(vm_id), node_name
+                    )
+
+                    if parsed_creds:
+                        # Store parsed creds on VM for later use
+                        vm["_parsed_creds"] = parsed_creds
+
+                        # Determine configured status for this VM by comparing parsed creds
+                        # against existing Guacamole connections. Possible values:
+                        #  - "not configured": connections don't exist in Guacamole yet
+                        #  - "Done": configured and in sync
+                        #  - "out of sync": configured but settings differ or passwords need encryption
+                        configured_status = "not configured"
+                        try:
+                            sync_issues: List[str] = []
+                            missing_connections = 0
+                            existing_connections = 0
+
+                            # If notes contain unencrypted passwords, mark as out of sync
+                            try:
+                                if proxmox_api.notes_contains_unencrypted_passwords(
+                                    notes
+                                ):
+                                    sync_issues.append("Unencrypted passwords in notes")
+                            except Exception:
+                                # If helper fails for any reason, don't crash; continue checks
+                                pass
+
+                            # Check each credential against existing connections
+                            for cred in parsed_creds:
+                                conn_name = cred.get("connection_name")
+                                if not conn_name:
+                                    continue
+                                existing = guac_api.get_connection_by_name(conn_name)
+                                if not existing:
+                                    missing_connections += 1
+                                    sync_issues.append(
+                                        f"Missing connection: {conn_name}"
+                                    )
+                                else:
+                                    existing_connections += 1
+                                    details = guac_api.get_connection_details(
+                                        existing["identifier"]
+                                    )
+                                    params = details.get("parameters", {})
+                                    # Collect mismatches
+                                    if params.get("username") != cred.get("username"):
+                                        sync_issues.append(
+                                            f"{conn_name}: username differs (Guac='{params.get('username')}' vs Notes='{cred.get('username')}')"
+                                        )
+                                    if params.get("port") != str(cred.get("port", "")):
+                                        sync_issues.append(
+                                            f"{conn_name}: port differs (Guac='{params.get('port')}' vs Notes='{cred.get('port')}')"
+                                        )
+                                    existing_proto = (
+                                        details.get("protocol")
+                                        or existing.get("protocol")
+                                        or ""
+                                    ).lower()
+                                    if (
+                                        existing_proto
+                                        and existing_proto
+                                        != cred.get("protocol", "").lower()
+                                    ):
+                                        sync_issues.append(
+                                            f"{conn_name}: protocol differs (Guac='{existing_proto}' vs Notes='{cred.get('protocol')}' )"
+                                        )
+
+                            # Determine final status
+                            if missing_connections > 0 and existing_connections == 0:
+                                # All connections missing
+                                configured_status = "not configured"
+                            elif missing_connections > 0 or sync_issues:
+                                # Some connections exist but issues found
+                                configured_status = "out of sync"
+                                vm["_sync_issues"] = sync_issues
+                            else:
+                                # All connections exist and match
+                                configured_status = "Done"
+                        except Exception:
+                            configured_status = "not configured"
+                        vm["_configured_status"] = configured_status
+                        # Check if any connection from this VM already exists
+                        has_existing_connections = any(
+                            cred.get("connection_name") in existing_connection_names
+                            for cred in parsed_creds
+                        )
+
+                        if has_existing_connections:
+                            vms_with_configured_creds.append(vm)
+                        else:
+                            vms_with_unconfigured_creds.append(vm)
+                    else:
+                        vms_without_creds.append(vm)
+                else:
+                    vms_without_creds.append(vm)
+            except Exception:
+                vms_without_creds.append(vm)
+
+        # Combine VMs in priority order: unconfigured with creds first, then configured, then without creds
+        prioritized_vms: List[Dict[str, Any]] = (
+            vms_with_unconfigured_creds + vms_with_configured_creds + vms_without_creds
+        )
+
+        console.print(f"\n[bold]Found {len(vms)} VMs in Proxmox:[/bold]")
+        if vms_with_unconfigured_creds:
+            console.print(
+                f"[green]* {len(vms_with_unconfigured_creds)} VMs ready for setup (have credentials in notes)[/green]"
+            )
+        if vms_with_configured_creds:
+            console.print(
+                f"[yellow]✔ {len(vms_with_configured_creds)} VMs already configured[/yellow]"
+            )
+
+        table = Table(title=f" Proxmox VMs ({len(prioritized_vms)} found)")
+        table.add_column("#", style="bold", no_wrap=True, width=4)
+        table.add_column("ID", style="cyan", no_wrap=True, width=6)
+        table.add_column("Name", style="magenta", min_width=18)
+        table.add_column("Node", style="cyan", no_wrap=True, width=8)
+        table.add_column("Status", style="bold", no_wrap=True, width=12)
+        table.add_column("Configured", style="bold", no_wrap=True, width=12)
+        table.add_column("Memory", style="bold", no_wrap=True, width=10)
+
+        def _format_memory(val: Any) -> str:
+            try:
+                num = int(val)
+            except Exception:
+                return str(val)
+
+            # If value looks like bytes, convert to MiB/GiB; otherwise keep
+            # Assume value in bytes if > 1024
+            if num >= 1024:
+                mib = num / 1024.0 / 1024.0
+                if mib >= 1024:
+                    return f"{mib/1024.0:.1f}GiB"
+                return f"{mib:.0f}MiB"
+            return f"{num}B"
+
+        for idx, vm in enumerate(prioritized_vms, start=1):
+            status = vm.get("status", "N/A")
+            if status == "running":
+                status_icon = "[green]●[/green] running"
+            elif status == "stopped":
+                status_icon = "[yellow]○[/yellow] stopped"
+            else:
+                status_icon = f"[red]{status}[/red]"
+
+            # Determine configured status ('' / Done / out of sync)
+            cfg = vm.get("_configured_status", "")
+            if cfg == "Done":
+                configured_display = "[green]Done[/green]"
+            elif cfg == "out of sync":
+                configured_display = "[red]Out of sync[/red]"
+            else:
+                # If VM has credentials but none exist in Guacamole, show empty (user will see "ready" note above)
+                configured_display = ""
+
+            # VM name fallback: try name, then hostname, then vmid
+            vm_name = vm.get("name") or vm.get("hostname") or str(vm.get("vmid", "N/A"))
+
+            mem_display = ""  # default blank
+            mem_val = vm.get("_memory")
+            if mem_val is not None:
+                mem_display = _format_memory(mem_val)
+            table.add_row(
+                str(idx),
+                str(vm.get("vmid", "N/A")),
+                vm_name,
+                vm.get("node", ""),
+                status_icon,
+                configured_display,
+                mem_display,
+            )
+
+        console.print(table)
+
+        # Always show sync issue details if present
+        any_sync = [vm for vm in vms if vm.get("_sync_issues")]
+        if any_sync:
+            console.print("\n[red]Out-of-sync details:[/red]")
+            for vm in any_sync:
+                name = vm.get("name") or vm.get("vmid")
+                for issue in vm.get("_sync_issues", []):
+                    console.print(f"  - [cyan]{name}[/cyan] -> {issue}")
+
+        # Update vms to use the prioritized order
+        vms = prioritized_vms
+    elif not start_external:
+        print("Warning: No VMs found in Proxmox. This could mean:")
+        print("  - No VMs are created yet (create them in Proxmox web interface)")
+        print("  - Token lacks VM listing permissions")
+        print("  - VMs exist on different nodes in a cluster")
+        print()
+        manual_choice = (
+            input("Continue with manual VM entry? (y/n) [y]: ").strip().lower()
+        )
+        if manual_choice and manual_choice not in ("y", "yes"):
+            return False
+
+        # Create a fake VM entry for manual mode
+        vms = [
+            {
+                "vmid": "manual",
+                "name": "Manual Entry",
+                "node": "manual",
+                "status": "manual",
+            }
+        ]
+
+    selected_vm = None
+    is_external_host = False
+    vm_lookup_by_id = {str(vm.get("vmid")): vm for vm in vms}
+    detected_mac: Optional[str] = None  # ensure symbol exists for external host flow
+
+    if start_external:
+        is_external_host = True
+        selected_vm = {
+            "vmid": "external",
+            "name": "External Host",
+            "node": "external",
+            "status": "external",
+        }
+    elif specific_vm_id is not None and specific_node is not None:
+        # Non-interactive mode: find VM by ID and node
+        vm_key = str(specific_vm_id)
+        if vm_key in vm_lookup_by_id:
+            candidate_vm = vm_lookup_by_id[vm_key]
+            if candidate_vm.get("node") == specific_node:
+                selected_vm = candidate_vm
+                console.print(
+                    f"[green]Selected VM:[/green] {candidate_vm.get('name', 'N/A')} (ID: {specific_vm_id}, Node: {specific_node})"
+                )
+            else:
+                console.print(
+                    f"[red]VM {specific_vm_id} found but on different node (expected: {specific_node}, found: {candidate_vm.get('node')})[/red]"
+                )
+                return False
+        else:
+            console.print(f"[red]VM with ID {specific_vm_id} not found[/red]")
+            return False
+    else:
+        # Use interactive VM selection with TAB navigation
+        vm_options: List[Tuple[str, str]] = []
+        for idx, vm in enumerate(vms, start=1):
+            vm_name = vm.get("name") or vm.get("hostname") or str(vm.get("vmid", "N/A"))
+            status = vm.get("status", "N/A")
+            status_icon = (
+                "●" if status == "running" else "○" if status == "stopped" else "?"
+            )
+            vm_options.append(
+                (
+                    str(idx),
+                    f"{status_icon} {vm_name} (ID: {vm.get('vmid', 'N/A')}, Node: {vm.get('node', 'N/A')})",
+                )
+            )
+
+        # Add option to return to main menu
+        vm_options.append(("0", "● Return to main menu"))
+
+        console.print("\n" + "-" * 50)
+        selection = interactive_menu_with_navigation(
+            vm_options, "Select VM to Add to Guacamole"
+        )
+
+        if selection == "0":
+            return False
+        if selection.isdigit():
+            index = int(selection) - 1
+            if 0 <= index < len(vms):
+                selected_vm = vms[index]
+            else:
+                console.print("[red]Invalid selection[/red]")
+                return False
+        else:
+            console.print("[red]Invalid selection[/red]")
+            return False
+
+    if is_external_host:
+        # Handle external host configuration
+        if external_config:
+            # Use provided configuration for non-interactive mode
+            host_name = external_config.get("name", external_config["hostname"])
+            selected_hostname = external_config["hostname"]
+            vm_name = host_name
+            vm_node = None
+            vm_id = None
+            original_status = "external"
+            parsed_credentials: List[Dict[str, Any]] = []
+            vm_macs: List[str] = []
+            network_details: List[Dict[str, Any]] = []
+            vm_notes = ""
+            vm_was_started = False
+
+            # Create parsed credentials from external config
+            parsed_credentials = [
+                {
+                    "connection_name": external_config["connection_name"],
+                    "username": external_config["username"],
+                    "password": external_config["password"],
+                    "protocol": external_config["protocol"],
+                    "port": external_config["port"],
+                    "connection_name_template": external_config["connection_name"],
+                    "wol_settings": None,
+                    "rdp_settings": None,
+                }
+            ]
+
+            # Set WoL if provided
+            if external_config.get("mac_address"):
+                selected_mac = external_config["mac_address"]
+            enable_wol = external_config.get("enable_wol", False)
+
+            print(f"\nExternal Host: {host_name} ({selected_hostname})")
+        else:
+            # Interactive mode
+            print("\n External Host Configuration")
+            print("=" * 40)
+
+            host_name = input("Host name/description: ").strip()
+            if not host_name:
+                host_name = "External Host"
+
+            selected_hostname = input("Hostname/IP address: ").strip()
+            if not selected_hostname:
+                print("Hostname/IP is required for external hosts")
+                return False
+
+            # External hosts have no Proxmox integration
+            vm_name = host_name
+            vm_node = None
+            vm_id = None
+            original_status = "external"
+            parsed_credentials = []
+            vm_macs = []
+            network_details = []
+            vm_notes = ""
+            vm_was_started = False
+
+            print(f"\nExternal Host: {host_name} ({selected_hostname})")
+            # Attempt passive MAC detection for external host
+        detected_mac = None
+        if selected_hostname and re.match(
+            r"^\d+\.\d+\.\d+\.\d+$", selected_hostname
+        ):  # simple IPv4 check
+            detected_mac = NetworkScanner.find_mac_by_ip(selected_hostname)
+            if detected_mac:
+                print(f" Detected MAC via ARP: {detected_mac}")
+        # Skip later IP discovery / guidance entirely for external hosts
+
+        # Extended network + port scanning suggestions (external only)
+        try:
+            default_ports = {"ssh": 22, "rdp": 3389, "vnc": 5900}
+            network_range = NetworkScanner.get_local_network_range()
+            suggested: List[Tuple[str, List[str]]] = []  # (ip, [proto,...])
+            if network_range:
+                print(
+                    f"\nDiscovering active hosts on {network_range} (parallel ping sweep)..."
+                )
+                # Perform broader ping sweep (reuse existing but maybe widen host count)
+                try:
+                    NetworkScanner.ping_sweep_network(network_range)
+                except Exception:
+                    pass
+                # Collect ARP discovered IPs
+                arp_entries = NetworkScanner.scan_arp_table()
+                ips = [e["ip"] for e in arp_entries]
+                if ips:
+                    print(
+                        f" Found {len(ips)} ARP entries. Scanning default service ports (22,3389,5900)..."
+                    )
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    def check(
+                        ip: str, proto: str, port: int
+                    ) -> Optional[Tuple[str, str]]:
+                        try:
+                            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                                s.settimeout(0.35)
+                                if s.connect_ex((ip, port)) == 0:
+                                    return (ip, proto)
+                        except Exception:
+                            return None
+                        return None
+
+                    combos: List[Tuple[str, str, int]] = []
+                    for ip in ips:
+                        for proto, port in default_ports.items():
+                            combos.append((ip, proto, port))
+                    found: Dict[str, List[str]] = {}
+                    max_workers = min(64, len(combos)) or 1
+                    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                        futs = [
+                            ex.submit(check, ip, proto, port)
+                            for ip, proto, port in combos
+                        ]
+                        for fut in as_completed(futs):
+                            res = fut.result()
+                            if res:
+                                ip, proto = res
+                                found.setdefault(ip, []).append(proto)
+                    for ip, protos in found.items():
+                        suggested.append((ip, sorted(set(protos))))
+                if suggested:
+                    print("\nSuggested external hosts (detected open default ports):")
+                    for ip, protos in suggested[:15]:
+                        print(f"  {ip} -> {', '.join(protos)}")
+                    print(
+                        "(Select one of these IPs above if it matches your target; this list is not exhaustive.)"
+                    )
+            else:
+                print(
+                    "Could not determine local network range; skipping external host discovery suggestions."
+                )
+        except Exception as e:
+            print(f"Warning: External host suggestion scan failed: {e}")
+
+    else:
+        # Handle Proxmox VM configuration
+        vm_name = selected_vm.get("name", f"VM-{selected_vm.get('vmid')}")
+        vm_node = selected_vm.get("node")
+        if not vm_node:
+            vm_node = input("Proxmox node for this VM (e.g., pve): ").strip()
+            if not vm_node:
+                print("Unable to determine node for VM")
+                return False
+
+        vm_id_value: Optional[Union[str, int]] = selected_vm.get("vmid")
+        if vm_id_value is None:
+            while True:
+                try:
+                    vm_id_value = int(input("Enter VMID: ").strip())
+                    break
+                except ValueError:
+                    print("Please provide a numeric VMID")
+        vm_id = int(vm_id_value)
+
+        console.print(
+            f"\n[bold]Selected VM:[/bold] [cyan]{vm_name}[/cyan] (ID: [yellow]{vm_id}[/yellow], Node: [green]{vm_node}[/green])"
+        )
+
+        # Check VM status
+        vm_status = proxmox_api.get_vm_status(vm_node, vm_id)
+        original_status = vm_status.get("status", "unknown")
+        console.print(f"VM Status: [magenta]{original_status}[/magenta]")
+
+        # Get VM notes for credential parsing
+        vm_notes = proxmox_api.get_vm_notes(vm_node, vm_id)
+        parsed_credentials = proxmox_api.parse_credentials_from_notes(
+            vm_notes, vm_name, str(vm_id), vm_node, "unknown"
+        )
+
+        if parsed_credentials:
+            console.print(
+                f"\n[green] Found {len(parsed_credentials)} credential set(s) in VM notes:[/green]"
+            )
+            for i, cred in enumerate(parsed_credentials, 1):
+                console.print(
+                    f"  {i}. [cyan]{cred['username']}[/cyan] ([magenta]{cred['protocol']}[/magenta]) - [yellow]{cred['connection_name']}[/yellow]"
+                )
+            # Offer immediate action before proceeding
+            if not auto_approve:
+                while True:
+                    choice = (
+                        input(
+                            "Apply credentials from notes? (a=apply / i=ignore / e=edit) [a]: "
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    if choice in ("", "a", "apply"):
+                        break  # keep as-is
+                    if choice in ("i", "ignore"):
+                        parsed_credentials = []
+                        break
+                    if choice in ("e", "edit"):
+                        try:
+                            index_str = input(
+                                "Enter number of credential to edit (or blank to finish): "
+                            ).strip()
+                            if index_str and index_str.isdigit():
+                                idx = int(index_str) - 1
+                                if 0 <= idx < len(parsed_credentials):
+                                    cred = parsed_credentials[idx]
+                                    new_user = (
+                                        input(
+                                            f"Username [{cred['username']}]: "
+                                        ).strip()
+                                        or cred["username"]
+                                    )
+                                    new_proto = (
+                                        input(
+                                            f"Protocol (rdp/vnc/ssh) [{cred['protocol']}]: "
+                                        )
+                                        .strip()
+                                        .lower()
+                                        or cred["protocol"]
+                                    )
+                                    if new_proto not in ("rdp", "vnc", "ssh"):
+                                        print("Invalid protocol - keeping original")
+                                        new_proto = cred["protocol"]
+                                    try:
+                                        new_port_raw = input(
+                                            f"Port [{cred.get('port')}]: "
+                                        ).strip()
+                                        new_port = (
+                                            int(new_port_raw)
+                                            if new_port_raw
+                                            else cred.get("port")
+                                        )
+                                    except ValueError:
+                                        print("Invalid port - keeping original")
+                                        new_port = cred.get("port")
+                                    new_name = (
+                                        input(
+                                            f"Connection name [{cred['connection_name']}]: "
+                                        ).strip()
+                                        or cred["connection_name"]
+                                    )
+                                    cred["username"] = new_user
+                                    cred["protocol"] = new_proto
+                                    try:
+                                        if new_port is not None:
+                                            cred["port"] = str(int(new_port))
+                                    except Exception:
+                                        # Leave as original on failure
+                                        pass
+                                    cred["connection_name"] = new_name
+                                    print("Updated credential.")
+                                else:
+                                    print("Index out of range")
+                            else:
+                                break
+                        except Exception as e:
+                            print(f"Edit error: {e}")
+                        continue
+                    print("Please choose a / i / e")
+                    continue
+        else:
+            console.print(
+                "\n[yellow]Warning: No credentials found in VM notes[/yellow]"
+            )
+
+    # Network processing only for Proxmox VMs
+    if not is_external_host:
+        # vm_node can be None or other types in some code paths; ensure it's a string
+        if vm_node is None:
+            print(
+                "Unable to determine Proxmox node for this VM; skipping network discovery"
+            )
+            network_details = []
+        else:
+            # Cast/ensure type for static checkers (Pylance) and runtime safety
+            vm_node_str: str = str(vm_node)
+            # vm_id may sometimes be None (manual entries); ensure it's an int before calling
+            if vm_id is None:
+                print("VM ID is not available; skipping Proxmox network discovery")
+                network_details = []
+            else:
+                try:
+                    vm_id_int: int = int(vm_id)
+                except (ValueError, TypeError):
+                    print(f"Invalid VM ID '{vm_id}'; skipping network discovery")
+                    network_details = []
+                else:
+                    network_details = proxmox_api.get_vm_network_info(
+                        vm_node_str, vm_id_int
+                    )
+
+        # Get all MACs from network interfaces
+        vm_macs = []
+        if network_details:
+            for interface in network_details:
+                # Check multiple possible MAC fields
+                mac = (
+                    interface.get("mac")
+                    or interface.get("virtio")
+                    or interface.get("e1000")
+                    or interface.get("rtl8139")
+                )
+                if mac:
+                    vm_macs.append(mac)
+    else:
+        # External hosts have no network details from Proxmox
+        vm_macs = []
+        network_details = []
+
+    # Try to find any of the VM's MACs on the network (Proxmox VMs only)
+    network_scan_result = None
+    found_mac = None
+    vm_was_started = False
+
+    if vm_macs:
+        print(f"\n Found VM network adapter MAC(s): {', '.join(vm_macs)}")
+
+        # Try each MAC until we find one on the network
+        for mac in vm_macs:
+            network_scan_result = NetworkScanner.find_mac_on_network(mac)
+            if network_scan_result:
+                found_mac = mac
+                print(f"Found MAC {mac} on network at IP {network_scan_result['ip']}")
+                break
+
+        if not network_scan_result:
+            print("None of the VM's MACs found on network")
+            found_mac = vm_macs[0]  # Use first MAC as fallback
+
+        # Check VM state and automatically start if needed (Proxmox VMs only)
+        if original_status in ("stopped", "shutdown") and not is_external_host:
+            if auto_approve:
+                start_choice = "y"
+                print(
+                    f"\n VM is {original_status}. Auto-starting VM for connection setup..."
+                )
+            else:
+                start_choice = (
+                    input(
+                        f"\n VM is {original_status}. Start VM for connection setup? (y/n) [y]: "
+                    )
+                    .strip()
+                    .lower()
+                )
+
+            if (
+                start_choice == ""
+                or start_choice in ("y", "yes")
+                and vm_node
+                and vm_id
+                and proxmox_api.start_vm(vm_node, vm_id)
+            ):
+                vm_was_started = True
+                print(" Waiting 30 seconds for VM to boot and connect to network...")
+                time.sleep(30)
+
+                # Try network scan again with all MACs
+                print(" Scanning for VM on network after startup...")
+                for mac in vm_macs:
+                    network_scan_result = NetworkScanner.find_mac_on_network(mac)
+                    if network_scan_result:
+                        found_mac = mac
+                        print(
+                            f" Found MAC {mac} on network at IP {network_scan_result['ip']} after startup"
+                        )
+                        break
+
+                if not network_scan_result:
+                    print(
+                        "  VM started but not yet detected on network (may need more time to boot)"
+                    )
+        elif not network_scan_result and not is_external_host:
+            # VM is running but not found on network - this might be normal for some network configs
+            print(f"  VM is {original_status} but not detected on network")
+            print(
+                "    This could be normal if VM has no qemu-guest-agent or different network config"
+            )
+    # Initialize variables
+    selected_mac = None
+
+    # Skip IP discovery for external hosts (already have hostname)
+    if is_external_host:
+        ip_options: List[Dict[str, Any]] = []
+        mac_candidates: List[Dict[str, Any]] = []
+        # selected_hostname is already set for external hosts in the external host section above
+    else:
+        # IP discovery for Proxmox VMs
+        ip_options = []
+        mac_candidates = []
+
+        # First priority: Guest agent IPs (from running VM)
+        guest_agent_ips: List[Dict[str, Any]] = []
+        for interface in network_details:
+            mac = interface.get("mac")
+            if mac:
+                existing = next(
+                    (
+                        item
+                        for item in mac_candidates
+                        if item["mac"].lower() == mac.lower()
+                    ),
+                    None,
+                )
+                if not existing:
+                    mac_candidates.append(
+                        {
+                            "mac": mac,
+                            "interface": interface.get("guest_interface")
+                            or interface.get("interface"),
+                        }
+                    )
+
+            # Collect guest agent IPs (these have highest priority)
+            for addr in interface.get("ip_addresses", []):
+                ip_addr = addr.get("ip-address") or addr.get("address")
+                if not ip_addr:
+                    continue
+                # Skip loopback, link-local, and IPv6 addresses
+                if (
+                    ip_addr.startswith("127.")
+                    or ip_addr.startswith("169.254.")
+                    or ip_addr.startswith("::1")
+                    or ip_addr.startswith("fe80:")
+                ):
+                    continue
+                # Skip all IPv6 addresses
+                if "::" in ip_addr or (":" in ip_addr and "." not in ip_addr):
+                    continue
+
+                label = ip_addr
+                if addr.get("prefix") is not None:
+                    label += f"/{addr['prefix']}"
+                iface_name = (
+                    interface.get("guest_interface")
+                    or interface.get("interface")
+                    or "unknown"
+                )
+
+                guest_agent_ip: Dict[str, Any] = {
+                    "label": f"{label} (guest agent: {iface_name})",
+                    "address": ip_addr,
+                    "interface": iface_name,
+                    "mac": mac,
+                    "source": "guest_agent",
+                }
+                guest_agent_ips.append(guest_agent_ip)
+                ip_options.append(guest_agent_ip)
+
+        if guest_agent_ips:
+            console.print(
+                f"[green] Found {len(guest_agent_ips)} IP(s) from guest agent (highest priority)[/green]"
+            )
+        else:
+            console.print("[yellow]  No IPs found from guest agent[/yellow]")
+            console.print("    To enable: install qemu-guest-agent in VM and restart")
+
+        if not is_external_host:
+            selected_hostname = None
+        if network_scan_result:
+            scanned_ip = network_scan_result["ip"]
+            # Check if this IP is already in the options from guest agent
+            if not any(opt["address"] == scanned_ip for opt in ip_options):
+                # Add to end of list (lower priority than guest agent)
+                scanned_option: Dict[str, Any] = {
+                    "label": f"{scanned_ip} (network scan)",
+                    "address": scanned_ip,
+                    "interface": "network-scan",
+                    "mac": found_mac,
+                    "source": "network_scan",
+                }
+                ip_options.append(scanned_option)
+                print(f" Added network-scanned IP: {scanned_ip}")
+            else:
+                print(f" Network scan confirmed existing IP: {scanned_ip}")
+
+    # Handle IP selection
+    if not is_external_host:
+        selected_hostname = None
+
+    if ip_options:
+        # Reorder to prefer IPv4 addresses first while keeping relative ordering inside families
+        try:
+            ipv4_opts = [o for o in ip_options if ":" not in o.get("address", "")]
+            ipv6_opts = [o for o in ip_options if ":" in o.get("address", "")]
+            if ipv4_opts and ipv6_opts:
+                # Preserve original order inside each subset
+                orig_index = {id(o): i for i, o in enumerate(ip_options)}
+                ipv4_opts.sort(key=lambda o: orig_index[id(o)])
+                ipv6_opts.sort(key=lambda o: orig_index[id(o)])
+                ip_options = ipv4_opts + ipv6_opts
+        except Exception:
+            pass
+        console.print("\n[bold]Discovered IP addresses:[/bold]")
+        for idx, option in enumerate(ip_options, start=1):
+            source_icon = (
+                "●"
+                if option.get("source") == "guest_agent"
+                else "○" if option.get("source") == "network_scan" else ""
+            )
+            console.print(f"  {idx}. {source_icon} [green]{option['label']}[/green]")
+        if not auto_approve:
+            console.print("  m.  Enter manually")
+
+        chosen: Optional[Dict[str, Any]] = None
+        if auto_approve:
+            # Auto pick first IPv4 if present
+            chosen = next(
+                (o for o in ip_options if ":" not in o.get("address", "")),
+                ip_options[0],
+            )
+            print(f"Auto-selected (IPv4 preference): {chosen['label']}")
+        else:
+            while True:
+                ip_choice = (
+                    input("Choose IP for Guacamole connection [1]: ").strip().lower()
+                )
+                if ip_choice in ("", "1"):
+                    chosen = ip_options[0]
+                    break
+                if ip_choice == "m":
+                    manual_ip = input("Enter IP address or hostname: ").strip()
+                    if manual_ip:
+                        selected_hostname = manual_ip
+                        break
+                    print("Hostname cannot be empty")
+                    continue
+                if ip_choice.isdigit():
+                    idx = int(ip_choice) - 1
+                    if 0 <= idx < len(ip_options):
+                        chosen = ip_options[idx]
+                        break
+                print(
+                    "Invalid choice. Please select from the list or 'm' for manual entry."
+                )
+
+        if selected_hostname is None and chosen is not None:
+            selected_hostname = chosen["address"]
+            selected_mac = chosen.get("mac")
+            console.print(
+                f"[cyan]Selected IP:[/cyan] [green]{selected_hostname}[/green]"
+            )
+
+        # Update parsed credentials with actual IP if we have it (Proxmox VMs only)
+        if (
+            (
+                selected_hostname
+                and selected_hostname != "unknown"
+                and parsed_credentials
+                and not is_external_host
+            )
+            and vm_id is not None
+            and vm_node
+        ):
+            parsed_credentials = proxmox_api.parse_credentials_from_notes(
+                vm_notes, vm_name, str(vm_id), vm_node, selected_hostname
+            )
+    else:
+        if not is_external_host:
+            # No IP options found - provide helpful guidance (Proxmox only)
+            print(f"\n  No IP addresses could be automatically detected for {vm_name}")
+            print("   This is likely because:")
+            print(
+                "   • Guest agent is not installed/running (install qemu-guest-agent)"
+            )
+            print("   • VM is stopped or not network accessible")
+            print("   • VM is on a different network segment")
+            print()
+
+            while True:
+                manual_ip = input("Enter VM IP address/hostname: ").strip()
+                if manual_ip:
+                    selected_hostname = manual_ip
+                    break
+                print("Hostname is required to create connection")
+        else:
+            # External host path: keep original entered hostname
+            pass
+
+    if not selected_hostname:
+        console.print("[red]Unable to determine hostname for the connection.[/red]")
+        return False
+    selected_hostname = str(selected_hostname)
+
+    # Prefer ARP/MAC detection order (detected_mac set in external branch if applicable)
+
+    if found_mac:
+        selected_mac = found_mac
+        print(f"\nUsing network-discovered MAC: {found_mac}")
+    elif not selected_mac and mac_candidates:
+        selected_mac = mac_candidates[0]["mac"]
+    elif is_external_host and detected_mac and not selected_mac:
+        selected_mac = detected_mac
+        print(f"Using detected external host MAC: {selected_mac}")
+
+    if mac_candidates and not auto_approve:
+        console.print("\n[bold]Available MAC addresses:[/bold]")
+        for idx, option in enumerate(mac_candidates, start=1):
+            label = option["mac"]
+            if option.get("interface"):
+                label += f" (iface: {option['interface']})"
+            # Mark the preferred MAC
+            if option["mac"] == selected_mac:
+                if option["mac"] == found_mac:
+                    label += " (network-discovered, default)"
+                else:
+                    label += " (default)"
+            console.print(f"  {idx}. [yellow]{label}[/yellow]")
+        console.print("  m. Enter manually")
+
+        while True:
+            mac_choice = input("Choose MAC for Wake-on-LAN [1]: ").strip().lower()
+            if mac_choice in ("", "1"):
+                selected_mac = mac_candidates[0]["mac"]
+                break
+            if mac_choice == "m":
+                manual_mac = input(
+                    "Enter MAC address (e.g., 52:54:00:12:34:56): "
+                ).strip()
+                if WakeOnLan.validate_mac_address(manual_mac):
+                    selected_mac = manual_mac
+                    break
+                print("Invalid MAC address format")
+                continue
+            if mac_choice.isdigit():
+                idx = int(mac_choice) - 1
+                if 0 <= idx < len(mac_candidates):
+                    selected_mac = mac_candidates[idx]["mac"]
+                    break
+            print(
+                "Invalid choice. Please select from the list or 'm' for manual entry."
+            )
+
+    # Allow users to override hostname even after selection
+    if override_hostname:
+        selected_hostname = override_hostname
+        print(f"Using overridden hostname: {selected_hostname}")
+    elif auto_approve:
+        print(f"Using hostname: {selected_hostname}")
+    else:
+        hostname_override = input(
+            f"Hostname for connections [{selected_hostname}]: "
+        ).strip()
+        if hostname_override:
+            selected_hostname = hostname_override
+
+    # Skip protocol selection in auto-approve mode - protocols must come from VM notes
+    default_protocol = override_protocol
+    default_port = override_port
+    if not auto_approve and override_protocol is None:
+        dp = (
+            input(
+                "Default protocol for connections (rdp/vnc/ssh) [leave blank to set per-account]: "
+            )
+            .strip()
+            .lower()
+        )
+        if dp and dp not in ("rdp", "vnc", "ssh"):
+            console.print(
+                "[yellow]Warning: Invalid protocol. Protocols must be specified per account.[/yellow]"
+            )
+            dp = None
+        default_protocol = dp or None
+
+        if default_protocol == "rdp":
+            default_port = config.DEFAULT_RDP_PORT
+        elif default_protocol == "ssh":
+            default_port = 22
+        elif default_protocol == "vnc":
+            default_port = config.DEFAULT_VNC_PORT
+
+        if default_port is not None:
+            proto_label = default_protocol.upper() if default_protocol else ""
+            port_input = input(
+                f"Default port for {proto_label} connections [{default_port}]: "
+            ).strip()
+            if port_input:
+                try:
+                    default_port = int(port_input)
+                except ValueError:
+                    console.print(
+                        "[yellow]Warning: Invalid port specified. Using default.[/yellow]"
+                    )
+    elif override_protocol:
+        if override_protocol not in ("rdp", "vnc", "ssh"):
+            console.print(
+                f"[red]Error: Invalid protocol '{override_protocol}'. Must be rdp, vnc, or ssh.[/red]"
+            )
+            return False
+        if override_port is None:
+            if override_protocol == "rdp":
+                default_port = config.DEFAULT_RDP_PORT
+            elif override_protocol == "ssh":
+                default_port = 22
+            elif override_protocol == "vnc":
+                default_port = config.DEFAULT_VNC_PORT
+    else:
+        console.print(
+            "[yellow]Auto-approve mode: Protocols and settings must be specified in VM notes[/yellow]"
+        )
+
+    # Connection count is now determined by parsed credentials or manual entry
+
+    enable_wol = override_wol if override_wol is not None else False
+    if override_mac:
+        selected_mac = override_mac
+
+    if selected_mac:
+        if override_wol is not None:
+            print(
+                f"Wake-on-LAN {'enabled' if enable_wol else 'disabled'} with MAC: {selected_mac}"
+            )
+        elif auto_approve:
+            enable_wol = True
+            print(f"Wake-on-LAN enabled with MAC: {selected_mac}")
+        else:
+            wol_choice = (
+                input("Enable Wake-on-LAN for these connections? (y/n) [y]: ")
+                .strip()
+                .lower()
+            )
+            if wol_choice == "" or wol_choice in ("y", "yes"):
+                enable_wol = True
+    else:
+        if override_wol is not None and override_wol:
+            console.print(
+                "[yellow]Warning: Wake-on-LAN requested but no MAC address available.[/yellow]"
+            )
+            enable_wol = False
+        elif auto_approve:
+            print("Warning: No MAC detected. Wake-on-LAN will be disabled.")
+        else:
+            wol_choice = (
+                input("No MAC detected. Provide one to enable Wake-on-LAN? (y/n) [n]: ")
+                .strip()
+                .lower()
+            )
+            if wol_choice in ("y", "yes"):
+                while True:
+                    manual_mac = input(
+                        "Enter MAC address (e.g., 52:54:00:12:34:56): "
+                    ).strip()
+                    if WakeOnLan.validate_mac_address(manual_mac):
+                        selected_mac = manual_mac
+                        enable_wol = True
+                        break
+                    print("Invalid MAC address format")
+
+    connections_to_create: List[Dict[str, Any]] = []
+
+    # Use parsed credentials if available, otherwise prompt for manual entry
+    if parsed_credentials:
+        print(f"\nUsing {len(parsed_credentials)} credential set(s) from VM notes")
+        for i, cred in enumerate(parsed_credentials):
+            protocol = cred["protocol"]
+            port_value = cred.get(
+                "port",
+                (
+                    config.DEFAULT_RDP_PORT
+                    if protocol == "rdp"
+                    else (22 if protocol == "ssh" else config.DEFAULT_VNC_PORT)
+                ),
+            )
+
+            connections_to_create.append(
+                {
+                    "name": cred["connection_name"],
+                    "username": cred["username"],
+                    "password": cred["password"],
+                    "protocol": protocol,
+                    "port": port_value,
+                    "rdp_settings": cred.get("rdp_settings"),
+                    "wol_settings": cred.get("wol_settings"),
+                    "wol_disabled": cred.get("wol_disabled", False),
+                }
+            )
+            print(
+                f"  {i+1}. {cred['connection_name']} ({cred['username']}, {protocol}:{port_value})"
+            )
+
+    # Manual credential entry if no parsed credentials or user declined
+    if not parsed_credentials:
+        if auto_approve:
+            print(
+                "\nWarning: No credentials in VM notes and auto-approve mode enabled."
+            )
+            print("Please add credentials to VM notes or disable auto-approve mode.")
+            return False
+
+        # Multiple user support - keep adding users until they say no
+        connection_index = 0
+        while True:
+            connection_index += 1
+            print("\n" + "-" * 50)
+            print(f"Account {connection_index}")
+            print("-" * 50)
+
+            username = input("Username: ").strip()
+            password = getpass.getpass("Password: ").strip()
+
+            # Protocol prompt: use default_protocol as fallback when left blank
+            if default_protocol:
+                protocol_prompt = (
+                    f"Protocol for this connection (rdp/vnc/ssh) [{default_protocol}]: "
+                )
+            else:
+                protocol_prompt = "Protocol for this connection (rdp/vnc/ssh): "
+
+            protocol = input(protocol_prompt).strip().lower()
+            if protocol == "" and default_protocol:
+                protocol = default_protocol
+
+            if protocol not in ("rdp", "vnc", "ssh"):
+                print("Error: Please specify a valid protocol (rdp/vnc/ssh)")
+                continue
+
+            # Port default: if this protocol matches the global default_protocol and default_port is set, use that
+            if default_port is not None and default_protocol == protocol:
+                port_value = default_port
+            else:
+                if protocol == "rdp":
+                    port_value = config.DEFAULT_RDP_PORT
+                elif protocol == "ssh":
+                    port_value = 22
+                else:  # vnc
+                    port_value = config.DEFAULT_VNC_PORT
+
+            port_override = input(
+                f"Port for {protocol.upper()} connection [{port_value}]: "
+            ).strip()
+            if port_override:
+                try:
+                    port_value = int(port_override)
+                except ValueError:
+                    console.print(
+                        "[yellow]Warning: Invalid port. Using default for this connection.[/yellow]"
+                    )
+
+            suggested_name = (
+                f"{vm_name}-{username}"
+                if username
+                else f"{vm_name}-conn{connection_index}"
+            )
+            connection_name = input(f"Connection name [{suggested_name}]: ").strip()
+            if not connection_name:
+                connection_name = suggested_name
+
+            connections_to_create.append(
+                {
+                    "name": connection_name,
+                    "username": username,
+                    "password": password,
+                    "protocol": protocol,
+                    "port": port_value,
+                    "rdp_settings": None,
+                    "wol_settings": None,
+                    "wol_disabled": False,
+                }
+            )
+
+            # Ask if user wants to add another connection
+            another_user = (
+                input(
+                    f"\nDo you want to set up another connection for this {'VM' if not is_external_host else 'computer'}? (y/n) [n]: "
+                )
+                .strip()
+                .lower()
+            )
+            if another_user not in ("y", "yes"):
+                break
+
+    parent_identifier = None
+    # Create a connection group only if there are multiple connections (for both VMs and external hosts)
+    if len(connections_to_create) > 1:
+        if auto_approve:
+            group_name = vm_name
+            console.print(f"[cyan]Creating connection group: {group_name}[/cyan]")
+            parent_identifier = guac_api.create_connection_group(group_name)
+            if parent_identifier is None:
+                console.print(
+                    "[yellow]Warning: Failed to create connection group. Connections will be created at root level.[/yellow]"
+                )
+        else:
+            connection_type = "host" if is_external_host else "VM"
+            group_choice = (
+                input(
+                    f"Create a connection group for {connection_type} connections? (y/n) [y]: "
+                )
+                .strip()
+                .lower()
+            )
+            if group_choice == "" or group_choice in ("y", "yes"):
+                default_group_name = vm_name
+                group_name = input(f"Group name [{default_group_name}]: ").strip()
+                if not group_name:
+                    group_name = default_group_name
+                parent_identifier = guac_api.create_connection_group(group_name)
+                if parent_identifier is None:
+                    console.print(
+                        "[yellow]Warning: Failed to create connection group. Connections will be created at root level.[/yellow]"
+                    )
+
+    # Check for duplicates/existing connections that might need updates
+    duplicates: List[str] = []
+    updates_needed: List[Tuple[Dict[str, Any], str]] = []
+    unique_connections: List[Dict[str, Any]] = []
+
+    for conn in connections_to_create:
+        # First check if connection exists in the target parent location
+        existing_conn = guac_api.get_connection_by_name_and_parent(
+            conn["name"], parent_identifier
+        )
+
+        if existing_conn:
+            # Connection exists in target location - check if it needs updating
+            params = existing_conn.get("parameters", {})
+            needs_update = (
+                params.get("hostname") != selected_hostname
+                or params.get("username") != conn["username"]
+                or params.get("password") != conn["password"]
+                or params.get("port") != str(conn["port"])
+            )
+
+            if needs_update:
+                updates_needed.append((conn, existing_conn["identifier"]))
+            else:
+                duplicates.append(conn["name"])
+        else:
+            # Check if connection exists in a different parent location
+            any_existing_conn = guac_api.get_connection_by_name(conn["name"])
+            if any_existing_conn:
+                # Connection exists but in wrong location - need to update its parent
+                print(
+                    f"Warning: Found connection '{conn['name']}' in different location - will update to use group"
+                )
+                updates_needed.append((conn, any_existing_conn["identifier"]))
+            else:
+                # Connection doesn't exist anywhere - create new
+                unique_connections.append(conn)
+
+    # Handle updates for existing connections
+    if updates_needed:
+        print(f"\nFound {len(updates_needed)} connection(s) that need updating:")
+        for conn, identifier in updates_needed:
+            print(f"  - {conn['name']} (password/settings changed)")
+
+        if not auto_approve:
+            update_choice = (
+                input(
+                    "\nAction for existing connections? (u=update / r=recreate / g=guac->notes / i=ignore) [u]: "
+                )
+                .strip()
+                .lower()
+            )
+            if update_choice in ("", "u", "update"):
+                # Multithreaded update execution
+                disable_threads = os.environ.get("GUAC_DISABLE_THREADS") == "1"
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from rich.progress import (
+                    BarColumn,
+                    TimeElapsedColumn,
+                )
+                from rich.live import Live
+
+                def do_update(entry: Tuple[Dict[str, Any], str]) -> Tuple[str, Optional[str]]:
+                    conn, identifier = entry
+                    try:
+                        conn_enable_wol = enable_wol and not conn.get(
+                            "wol_disabled", False
+                        )
+                        safe_host = selected_hostname or ""
+                        guac_api.update_connection(
+                            identifier=identifier,
+                            name=conn["name"],
+                            hostname=safe_host,
+                            username=conn["username"],
+                            password=conn["password"],
+                            port=conn["port"],
+                            protocol=conn["protocol"],
+                            enable_wol=conn_enable_wol,
+                            mac_address=selected_mac or "",
+                            parent_identifier=parent_identifier,
+                            rdp_settings=conn.get("rdp_settings"),
+                            wol_settings=conn.get("wol_settings"),
+                        )
+                        return (conn["name"], None)
+                    except Exception as e:
+                        return (conn["name"], str(e))
+
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(bar_width=None),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                )
+                task_id = progress.add_task(
+                    "Updating connections...", total=len(updates_needed)
+                )
+                update_status: Dict[str, Tuple[str, str]] = {
+                    c["name"]: ("queued", "") for c, _ in updates_needed
+                }
+
+                def build_table() -> Table:
+                    tbl = Table(box=None)
+                    tbl.add_column("Name", style="cyan")
+                    tbl.add_column("State", style="magenta")
+                    tbl.add_column("Result", style="green")
+                    for conn, _ in updates_needed:
+                        st, res = update_status.get(conn["name"], ("queued", ""))
+                        tbl.add_row(conn["name"], st, res)
+                    return tbl
+
+                with Live(
+                    build_table(), console=console, refresh_per_second=20
+                ), progress:
+                    if disable_threads or len(updates_needed) == 1:
+                        progress.update(
+                            task_id, description="Updating (sequential mode)..."
+                        )
+                        for entry in updates_needed:
+                            conn, _id = entry
+                            update_status[conn["name"]] = ("running", "")
+                            name, err = do_update(entry)
+                            update_status[name] = (
+                                ("done", "OK")
+                                if not err
+                                else ("error", err.split("\n")[0][:60])
+                            )
+                            progress.advance(task_id)
+                    else:
+                        max_workers = min(8, len(updates_needed))
+                        progress.update(
+                            task_id,
+                            description=f"Updating with {max_workers} workers...",
+                        )
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            future_map = {
+                                executor.submit(do_update, entry): entry
+                                for entry in updates_needed
+                            }
+                            for fut in as_completed(future_map):
+                                name, err = fut.result()
+                                update_status[name] = (
+                                    ("done", "OK")
+                                    if not err
+                                    else ("error", err.split("\n")[0][:60])
+                                )
+                                progress.advance(task_id)
+            elif update_choice in ("r", "recreate"):
+                for conn, identifier in updates_needed:
+                    print(f"Recreating: deleting '{conn['name']}' first")
+                    try:
+                        guac_api.delete_connection(identifier)
+                    except Exception as e:
+                        print(f"  Delete failed for {conn['name']}: {e}")
+                unique_connections.extend([c for c, _ in updates_needed])
+            elif update_choice in ("g", "guac", "guac->notes"):
+                # Pull settings from Guacamole into VM notes (bidirectional sync)
+                if not is_external_host and vm_node and vm_id:
+                    print("\nPulling connection settings from Guacamole to VM notes...")
+                    pulled_lines: List[str] = []
+                    for conn, identifier in updates_needed:
+                        existing_conn = guac_api.get_connection_details(identifier)
+                        if not existing_conn:
+                            continue
+                        params = existing_conn.get("parameters", {})
+                        proto = conn["protocol"]
+                        port = params.get("port") or str(conn.get("port"))
+                        username = params.get("username") or conn.get("username")
+                        password = params.get("password") or conn.get("password")
+                        # Compose structured line (unencrypted; encryption step will process)
+                        line = f'user:"{username}" pass:"{password}" protos:"{proto}" confName:"{conn["name"]}";'
+                        pulled_lines.append(line)
+                    if pulled_lines:
+                        try:
+                            existing_notes = (
+                                proxmox_api.get_vm_notes(vm_node, vm_id) or ""
+                            )
+                            # Remove any existing structured lines to avoid duplication
+                            note_lines = [
+                                line
+                                for line in existing_notes.splitlines()
+                                if not line.strip().endswith(";")
+                            ]
+                            note_lines.extend(pulled_lines)
+                            new_notes = "\n".join(note_lines)
+                            if proxmox_api.update_vm_notes(vm_node, vm_id, new_notes):
+                                print(
+                                    "  Updated VM notes with Guacamole connection settings"
+                                )
+                                # Trigger encryption/processing pass
+                                try:
+                                    proxmox_api.process_and_update_vm_notes(
+                                        vm_node, vm_id, new_notes
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                print(
+                                    "  Failed to update VM notes with pulled settings"
+                                )
+                        except Exception as e:
+                            print(f"  Error applying pulled settings: {e}")
+                else:
+                    print(
+                        "Cannot sync Guacamole settings to notes for external hosts or missing VM context."
+                    )
+            else:
+                print("Ignoring updates (leaving existing connections as-is).")
+        else:
+            print("Updating existing connections with new details (auto-approve mode)")
+            # Auto-approve path: use multithreaded execution too
+            disable_threads = os.environ.get("GUAC_DISABLE_THREADS") == "1"
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from rich.progress import (
+                BarColumn,
+                TimeElapsedColumn,
+            )
+            from rich.live import Live
+
+            def do_update(entry: Tuple[Dict[str, Any], str]) -> Tuple[str, Optional[str]]:
+                conn, identifier = entry
+                try:
+                    conn_enable_wol = enable_wol and not conn.get("wol_disabled", False)
+                    safe_host = selected_hostname or ""
+                    guac_api.update_connection(
+                        identifier=identifier,
+                        name=conn["name"],
+                        hostname=safe_host,
+                        username=conn["username"],
+                        password=conn["password"],
+                        port=conn["port"],
+                        protocol=conn["protocol"],
+                        enable_wol=conn_enable_wol,
+                        mac_address=selected_mac or "",
+                        parent_identifier=parent_identifier,
+                        rdp_settings=conn.get("rdp_settings"),
+                        wol_settings=conn.get("wol_settings"),
+                    )
+                    return (conn["name"], None)
+                except Exception as e:
+                    return (conn["name"], str(e))
+
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=None),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                console=console,
+            )
+            task_id = progress.add_task(
+                "Updating connections...", total=len(updates_needed)
+            )
+            update_status_batch: Dict[str, Tuple[str, str]] = {
+                c["name"]: ("queued", "") for c, _ in updates_needed
+            }
+
+            def build_table() -> Table:
+                tbl = Table(box=None)
+                tbl.add_column("Name", style="cyan")
+                tbl.add_column("State", style="magenta")
+                tbl.add_column("Result", style="green")
+                for conn, _ in updates_needed:
+                    st, res = update_status_batch.get(conn["name"], ("queued", ""))
+                    tbl.add_row(conn["name"], st, res)
+                return tbl
+
+            with Live(build_table(), console=console, refresh_per_second=20), progress:
+                if disable_threads or len(updates_needed) == 1:
+                    progress.update(
+                        task_id, description="Updating (sequential mode)..."
+                    )
+                    for entry in updates_needed:
+                        conn, _id = entry
+                        update_status_batch[conn["name"]] = ("running", "")
+                        name, err = do_update(entry)
+                        update_status_batch[name] = (
+                            ("done", "OK")
+                            if not err
+                            else ("error", err.split("\n")[0][:60])
+                        )
+                        progress.advance(task_id)
+                else:
+                    max_workers = min(8, len(updates_needed))
+                    progress.update(
+                        task_id,
+                        description=f"Updating with {max_workers} workers...",
+                    )
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map = {
+                            executor.submit(do_update, entry): entry
+                            for entry in updates_needed
+                        }
+                        for fut in as_completed(future_map):
+                            name, err = fut.result()
+                            update_status_batch[name] = (
+                                ("done", "OK")
+                                if not err
+                                else ("error", err.split("\n")[0][:60])
+                            )
+                            progress.advance(task_id)
+
+    # Handle duplicates (unchanged connections)
+    if duplicates:
+        print(f"\nFound {len(duplicates)} connection(s) already up-to-date:")
+        for name in duplicates:
+            print(f"  - {name}")
+
+    connections_to_create = unique_connections
+
+    if not connections_to_create:
+        print("\nWarning: No new connections to create (all already exist)")
+        return True
+
+    print(f"\nCreating {len(connections_to_create)} connection(s) (parallel)...")
+    created_connections: List[Tuple[str, Optional[str]]] = []
+    # Concurrency guard
+    disable_threads = os.environ.get("GUAC_DISABLE_THREADS") == "1"
+    max_workers = min(
+        8, max(1, len(connections_to_create))
+    )  # cap to keep UI responsive
+
+    def create_one(conn: Dict[str, Any]) -> Tuple[str, Optional[str], Optional[str]]:
+        """Worker: create a single connection; returns (name, identifier, error)."""
+        try:
+            conn_enable_wol = enable_wol and not conn.get("wol_disabled", False)
+            proto = conn["protocol"]
+            if proto == "rdp":
+                safe_host = selected_hostname or ""
+                identifier = guac_api.create_rdp_connection(
+                    name=conn["name"],
+                    hostname=safe_host,
+                    username=conn["username"],
+                    password=conn["password"],
+                    port=conn["port"],
+                    enable_wol=conn_enable_wol,
+                    mac_address=selected_mac or "",
+                    parent_identifier=parent_identifier,
+                    rdp_settings=conn.get("rdp_settings"),
+                    wol_settings=conn.get("wol_settings"),
+                )
+            elif proto == "ssh":
+                safe_host = selected_hostname or ""
+                identifier = guac_api.create_ssh_connection(
+                    name=conn["name"],
+                    hostname=safe_host,
+                    username=conn["username"],
+                    password=conn["password"],
+                    port=conn["port"],
+                    enable_wol=conn_enable_wol,
+                    mac_address=selected_mac or "",
+                    parent_identifier=parent_identifier,
+                    wol_settings=conn.get("wol_settings"),
+                )
+            else:  # vnc
+                safe_host = selected_hostname or ""
+                identifier = guac_api.create_vnc_connection(
+                    name=conn["name"],
+                    hostname=safe_host,
+                    password=conn["password"],
+                    port=conn["port"],
+                    enable_wol=conn_enable_wol,
+                    mac_address=selected_mac or "",
+                    parent_identifier=parent_identifier,
+                    wol_settings=conn.get("wol_settings"),
+                    vnc_settings=conn.get("vnc_settings"),
+                )
+
+            return conn["name"], identifier, None
+        except Exception as e:
+            return conn["name"], None, str(e)
+
+    status = {}  # connection name -> (state, msg)
+    futures: List[Future[Tuple[str, Optional[str], Optional[str]]]] = []
+
+    if disable_threads or len(connections_to_create) == 1:
+        # Sequential mode for debugging or single connection
+        print("Creating connections sequentially...")
+        for conn in connections_to_create:
+            name, identifier, err = create_one(conn)
+            if err:
+                status[name] = ("error", err.split("\n")[0][:60])
+            else:
+                status[name] = ("done", "OK")
+                created_connections.append((name, identifier))
+    else:
+        # Parallel mode with progress display
+        from rich.progress import BarColumn as ProgressBarColumn, TimeElapsedColumn as ProgressTimeElapsedColumn
+        from concurrent.futures import ThreadPoolExecutor as GuacThreadPoolExecutor, as_completed as futures_as_completed
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            ProgressBarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            ProgressTimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task(
+                "Creating connections...", total=len(connections_to_create)
+            )
+
+            with GuacThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                for conn in connections_to_create:
+                    status[conn["name"]] = ("queued", "")
+                    futures.append(executor.submit(create_one, conn))
+
+                # Collect results as they complete
+                for fut in futures_as_completed(futures):
+                    name, identifier, err = fut.result()
+                    if err:
+                        status[name] = ("error", err.split("\n")[0][:60])
+                    else:
+                        status[name] = ("done", "OK")
+                        created_connections.append((name, identifier))
+                    progress.advance(task_id)
+            # Final refresh
+            pass
+
+    successes = [name for name, identifier in created_connections if identifier]
+    failures = [name for name, identifier in created_connections if not identifier]
+
+    if successes:
+        console.print(
+            "\n[green]Successfully created the following connections:[/green]"
+        )
+        for name in successes:
+            console.print(f"  - [cyan]{name}[/cyan]")
+
+        # Mandatory: Update VM notes with encrypted credentials for Proxmox VMs (always attempt)
+        if not is_external_host and vm_node and vm_id:
+            try:
+                console.print(
+                    "\n[cyan]Processing and updating VM notes to ensure credentials are saved and encrypted...[/cyan]"
+                )
+                # If vm_notes existed, pass them through the processor; otherwise pass an empty string to prompt creation
+                to_process = vm_notes or ""
+                updated_notes = proxmox_api.process_and_update_vm_notes(
+                    vm_node, vm_id, to_process
+                )
+                if updated_notes and updated_notes != vm_notes:
+                    console.print(
+                        "    [green]VM notes updated with credentials/encryption[/green]"
+                    )
+                    vm_notes = updated_notes
+                else:
+                    # Decide whether we should append structured credentials.
+                    # Conditions:
+                    #  - We successfully created connections
+                    #  - Existing notes are empty OR contain no structured credential lines (legacy format like 'user:pass')
+                    try:
+                        has_structured = proxmox_api.has_structured_credentials(
+                            vm_notes
+                        )
+                    except Exception:
+                        has_structured = False
+
+                    if successes and (not vm_notes or not has_structured):
+                        try:
+                            lines: List[str] = []
+                            for conn_name, identifier in created_connections:
+                                conn = next(
+                                    (
+                                        c
+                                        for c in connections_to_create
+                                        if c["name"] == conn_name
+                                    ),
+                                    None,
+                                )
+                                if conn:
+                                    lines.append(
+                                        f'user:"{conn.get("username","")}" pass:"{conn.get("password","")}" protos:"{conn.get("protocol","")}" confName:"{conn.get("name","")}";'
+                                    )
+                            if lines:
+                                new_block = "\n".join(lines)
+                                # Append to existing notes (preserve legacy content) or set fresh
+                                combined = (
+                                    new_block
+                                    if not vm_notes
+                                    else f"{vm_notes.rstrip()}\n\n{new_block}"
+                                )
+                                if proxmox_api.update_vm_notes(
+                                    vm_node, vm_id, combined
+                                ):
+                                    action = "Appended" if vm_notes else "Saved"
+                                    console.print(
+                                        f"    [green]{action} structured credential lines to VM notes[/green]"
+                                    )
+                                    vm_notes = combined
+                                else:
+                                    console.print(
+                                        "    [yellow]Failed to update VM notes with structured credentials[/yellow]"
+                                    )
+                            else:
+                                console.print(
+                                    "    [yellow]No credential lines generated to append[/yellow]"
+                                )
+                        except Exception as e:
+                            console.print(
+                                f"    [yellow]Error while appending structured VM notes: {e}[/yellow]"
+                            )
+                    else:
+                        console.print(
+                            "    [green]VM notes processed (no change needed)[/green]"
+                        )
+            except Exception as e:
+                console.print(
+                    f"    [yellow]Warning: Could not process/update VM notes: {e}[/yellow]"
+                )
+
+    if failures:
+        console.print(
+            Panel("Failed to create the following connections:", border_style="red")
+        )
+        for name in failures:
+            console.print(f"  - [red]{name}[/red]")
+
+    if parent_identifier and successes:
+        console.print(
+            Panel(
+                f"Connections were grouped under: [cyan]{parent_identifier}[/cyan]",
+                border_style="cyan",
+            )
+        )
+
+    if enable_wol and selected_mac:
+        if auto_approve:
+            console.print(
+                "[yellow]Skipping Wake-on-LAN test (auto-approve mode)[/yellow]"
+            )
+        else:
+            test_wol = input("Test Wake-on-LAN now? (y/n) [n]: ").strip().lower()
+            if test_wol in ("y", "yes"):
+                WakeOnLan.send_wol_packet(selected_mac)
+
+    # Offer to restore previous power state if we started the VM (Proxmox VMs only)
+    if (
+        vm_was_started
+        and original_status in ("stopped", "shutdown")
+        and not is_external_host
+    ):
+        if auto_approve:
+            console.print(
+                f"[blue]Restoring VM to previous power state ({original_status})[/blue]"
+            )
+            if vm_node and vm_id and proxmox_api.stop_vm(vm_node, vm_id):
+                console.print(f"[green]VM restored to {original_status} state[/green]")
+            else:
+                console.print(
+                    f"[yellow]Failed to restore VM to {original_status} state[/yellow]"
+                )
+        else:
+            restore_choice = (
+                input(
+                    f"\nRestore VM to previous power state ({original_status})? (y/n) [n]: "
+                )
+                .strip()
+                .lower()
+            )
+            if restore_choice in ("y", "yes"):
+                if vm_node and vm_id and proxmox_api.stop_vm(vm_node, vm_id):
+                    console.print(
+                        f"[green]VM restored to {original_status} state[/green]"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]Failed to restore VM to {original_status} state[/yellow]"
+                    )
+
+    return len(failures) == 0
+
+
+def send_wol_manual() -> bool:
+    """Manual Wake-on-LAN function"""
+    print("\n" + "=" * 50)
+    print("Send Wake-on-LAN Packet")
+    print("=" * 50)
+
+    while True:
+        mac_address = input("MAC Address (e.g., 52:54:00:12:34:56): ").strip()
+        if WakeOnLan.validate_mac_address(mac_address):
+            break
+        print("Invalid MAC address format")
+
+    broadcast_ip = input("Broadcast IP [255.255.255.255]: ").strip()
+    if not broadcast_ip:
+        broadcast_ip = "255.255.255.255"
+
+    port_str = input("Port [9]: ").strip()
+    port = int(port_str) if port_str else 9
+
+    return WakeOnLan.send_wol_packet(mac_address, broadcast_ip, port)
+
+
+def list_connections(
+    filter_connection: Optional[str] = None,
+    filter_vm: Optional[str] = None,
+    filter_protocol: Optional[str] = None,
+    filter_status: Optional[str] = None,
+    filter_group: Optional[str] = None,
+    json_output: bool = False,
+    csv_output: Optional[str] = None,
+) -> bool:
+    """List existing Guacamole connections with filtering options"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    connections = guac_api.get_connections()
+
+    if not connections:
+        console.print(Panel(" No connections found.", border_style="yellow"))
+        return True
+
+    # Pre-build a mapping of connection names to PVE sources for efficiency
+    connection_to_pve_source: Dict[str, str] = {}
+    connection_to_vm_info: Dict[str, Tuple[str, int]] = {}  # Also store VM info for encryption checks
+    proxmox_api = None
+    try:
+        proxmox_api = ProxmoxAPI(config)
+        all_vms = proxmox_api.get_vms()
+
+        # Group VMs by node for efficient lookup
+        vms_by_node: Dict[str, List[Dict[str, Any]]] = {}
+        for vm in all_vms:
+            node_name = vm.get("node")
+            if node_name and node_name not in vms_by_node:
+                vms_by_node[node_name] = []
+            if node_name:
+                vms_by_node[node_name].append(vm)
+
+        # Build connection name to PVE node mapping and VM info mapping
+        for node_name, vms in vms_by_node.items():
+            for vm in vms:
+                vm_id = vm.get("vmid")
+                vm_name = vm.get("name", "")
+
+                if vm_id is not None:
+                    try:
+                        vm_config = proxmox_api.get_vm_config(node_name, vm_id)
+                        notes = vm_config.get("description", "")
+
+                        if notes:
+                            try:
+                                parsed_creds = proxmox_api.parse_credentials_from_notes(
+                                    notes,
+                                    vm_name,
+                                    str(vm_id),
+                                    node_name,
+                                    prompt_on_decrypt_failure=False,
+                                )
+                            except CredentialRecoveryPending:
+                                # Skip mapping for this VM; listing will show as unknown
+                                parsed_creds = []
+
+                            for cred in parsed_creds:
+                                connection_name = cred.get("connection_name")
+                                if connection_name and vm_id is not None:
+                                    connection_to_pve_source[connection_name] = node_name
+                                    connection_to_vm_info[connection_name] = (
+                                        node_name,
+                                        vm_id,
+                                    )
+                    except Exception:
+                        continue
+    except Exception:
+        # If Proxmox is not accessible, all connections will show as "Unknown"
+        pass
+
+    # Collect filtered connections first to get accurate count
+    filtered_connections: List[Dict[str, Any]] = []
+
+    for conn_id, conn in connections.items():
+        name = conn.get("name", "N/A")
+        protocol = conn.get("protocol", "N/A")
+
+        # Get detailed connection parameters
+        conn_details = guac_api.get_connection_details(conn_id)
+        params = conn_details.get("parameters", {})
+
+        ip_address = params.get("hostname", "N/A")
+        display_hostname = ip_address
+
+        if ip_address and ip_address != "N/A":
+            try:
+                # Try to resolve hostname from IP address
+                resolved_hostname = socket.gethostbyaddr(ip_address)[0]
+                # Show just the hostname for cleaner display
+                if len(resolved_hostname) > 20:
+                    # Truncate long hostnames
+                    display_hostname = f"{resolved_hostname[:17]}..."
+                else:
+                    display_hostname = resolved_hostname
+            except (socket.herror, socket.gaierror, OSError):
+                # If resolution fails, just show the IP address
+                display_hostname = ip_address
+
+        # Get port from parameters
+        port_mapping = {
+            "rdp": params.get("port", "3389"),
+            "vnc": params.get("port", "5900"),
+            "ssh": params.get("port", "22"),
+        }
+        port = port_mapping.get(protocol.lower(), params.get("port", "N/A"))
+
+        # Improved WoL detection and sync status
+        wol_send_param = params.get("wol-send-packet", False)
+        wol_mac_param = params.get("wol-mac-addr", "")
+
+        # Check wol-send-packet parameter
+        if isinstance(wol_send_param, str):
+            send_packet_enabled = wol_send_param.lower() in ["true", "1", "yes", "on"]
+        elif isinstance(wol_send_param, bool):
+            send_packet_enabled = wol_send_param
+        else:
+            send_packet_enabled = False
+
+        # WoL is enabled if both send-packet is true and MAC address is present
+        wol_enabled = send_packet_enabled and wol_mac_param and wol_mac_param.strip()
+
+        # Get PVE source from pre-built mapping
+        pve_source = connection_to_pve_source.get(name, "Manual")
+
+        # Enhanced sync status with symbols
+        if pve_source != "Manual":
+            # Enhanced sync status: check multiple factors
+            sync_issues: List[str] = []
+
+            # Check if port matches expected defaults
+            expected_ports = {"rdp": "3389", "vnc": "5900", "ssh": "22"}
+            expected_port = expected_ports.get(protocol.lower())
+            if expected_port and port != expected_port:
+                sync_issues.append("port diff")
+
+            # Check if WoL is configured (good practice for VM connections)
+            if not wol_enabled:
+                sync_issues.append("no WoL")
+
+            # Check if VM notes contain unencrypted passwords
+            vm_info = connection_to_vm_info.get(name)
+            if vm_info and proxmox_api is not None:
+                try:
+                    node_name, vm_id = vm_info
+                    # Get raw VM config to check notes without triggering auto-encryption
+                    vm_config = proxmox_api.get_vm_config(node_name, vm_id)
+                    raw_notes = vm_config.get("description", "") or vm_config.get(
+                        "notes", ""
+                    )
+                    if raw_notes:
+                        # URL-decode if needed
+                        try:
+                            from urllib.parse import unquote
+
+                            raw_notes = unquote(raw_notes)
+                        except Exception:
+                            pass
+                        if proxmox_api.notes_contains_unencrypted_passwords(raw_notes):
+                            sync_issues.append("unencrypted password")
+                except Exception:
+                    # If we can't check encryption status, don't fail the whole listing
+                    pass
+
+            # Determine final sync status
+            if sync_issues:
+                issue_text = ", ".join(sync_issues[:2])  # Show max 2 issues
+                if len(sync_issues) > 2:
+                    issue_text += f" (+{len(sync_issues)-2})"
+                sync_status = f"[yellow]⚠ {issue_text}[/yellow]"
+            else:
+                sync_status = "[green]✓ OK[/green]"
+        else:
+            sync_status = "[dim]Manual[/dim]"
+
+        # Apply filters with regex support
+        should_include = True
+
+        # Filter by connection name pattern
+        if filter_connection:
+
+            try:
+                if not re.search(filter_connection, name, re.IGNORECASE):
+                    should_include = False
+            except re.error:
+                # If regex is invalid, treat as literal string
+                if filter_connection.lower() not in name.lower():
+                    should_include = False
+
+        # Filter by VM name pattern
+        if should_include and filter_vm:
+
+            try:
+                if not re.search(filter_vm, pve_source, re.IGNORECASE):
+                    should_include = False
+            except re.error:
+                # If regex is invalid, treat as literal string
+                if filter_vm.lower() not in pve_source.lower():
+                    should_include = False
+
+        # Filter by protocol
+        if (
+            should_include
+            and filter_protocol
+            and protocol.lower() != filter_protocol.lower()
+        ):
+            should_include = False
+
+        # Filter by status
+        if should_include and filter_status:
+            status_text = sync_status.lower()
+            if "ok" in filter_status.lower() and "✓ ok" not in status_text:
+                should_include = False
+            elif "out-of-sync" in filter_status.lower() and "⚠" not in status_text:
+                should_include = False
+            elif "error" in filter_status.lower() and (
+                "error" not in status_text and "✗" not in status_text
+            ):
+                should_include = False
+            elif "manual" in filter_status.lower() and "manual" not in status_text:
+                should_include = False
+
+        # Filter by group
+        if should_include and filter_group:
+
+            group_name = conn.get("parentIdentifier", "ROOT")
+            if group_name != "ROOT":
+                # Get group name from identifier
+                groups = guac_api.get_connection_groups()
+                if group_name in groups:
+                    group_name = groups[group_name].get("name", group_name)
+
+            try:
+                if not re.search(filter_group, group_name, re.IGNORECASE):
+                    should_include = False
+            except re.error:
+                # If regex is invalid, treat as literal string
+                if filter_group.lower() not in group_name.lower():
+                    should_include = False
+
+        # Collect connection data if it passes all filters
+        if should_include:
+            # Strip rich markup and convert Unicode symbols to ASCII for plain text output
+            sync_status_plain = sync_status
+            for tag in ["[green]", "[/green]", "[yellow]", "[/yellow]", "[red]", "[/red]", "[dim]", "[/dim]"]:
+                sync_status_plain = sync_status_plain.replace(tag, "")
+            
+            # Convert Unicode symbols to plain ASCII text for JSON/CSV
+            sync_status_plain = sync_status_plain.replace("✓", "").replace("⚠", "Warning:").replace("✗", "Error:")
+            sync_status_plain = sync_status_plain.strip()
+            
+            # Normalize status text for JSON/CSV
+            if sync_status_plain == "OK":
+                sync_status_plain = "OK"
+            elif sync_status_plain.startswith("Warning:"):
+                sync_status_plain = sync_status_plain.replace("Warning:", "").strip()
+            elif sync_status_plain.startswith("Error:"):
+                sync_status_plain = sync_status_plain.replace("Error:", "").strip()
+            
+            filtered_connections.append({
+                "connection_id": conn_id,
+                "name": name,
+                "hostname": display_hostname,
+                "protocol": protocol.upper(),
+                "port": str(port),
+                "pve_source": pve_source,
+                "sync_status": sync_status_plain,
+                "sync_status_rich": sync_status,  # Keep rich version for table display
+            })
+
+    # Handle different output formats
+    if json_output:
+        # Output as JSON
+        import json as json_module
+        output_data = {
+            "total_connections": len(connections),
+            "filtered_connections": len(filtered_connections),
+            "connections": [
+                {
+                    "connection_id": conn["connection_id"],
+                    "name": conn["name"],
+                    "hostname": conn["hostname"],
+                    "protocol": conn["protocol"],
+                    "port": conn["port"],
+                    "pve_source": conn["pve_source"],
+                    "sync_status": conn["sync_status"],
+                }
+                for conn in filtered_connections
+            ]
+        }
+        print(json_module.dumps(output_data, indent=2))
+        return True
+    
+    if csv_output:
+        # Output to CSV file
+        try:
+            import csv
+            with open(csv_output, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ["name", "hostname", "protocol", "port", "pve_source", "sync_status"]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for conn in filtered_connections:
+                    writer.writerow({
+                        "name": conn["name"],
+                        "hostname": conn["hostname"],
+                        "protocol": conn["protocol"],
+                        "port": conn["port"],
+                        "pve_source": conn["pve_source"],
+                        "sync_status": conn["sync_status"],
+                    })
+            console.print(f"[green]✓[/green] Exported {len(filtered_connections)} connections to {csv_output}")
+            return True
+        except Exception as e:
+            console.print(f"[red]Error writing CSV file: {e}[/red]")
+            return False
+    
+    # Default: Rich table output
+    # Create enhanced title with filtered count
+    if len(filtered_connections) == len(connections):
+        # No filters applied or all match
+        title_text = f"● Guacamole Connections ({len(filtered_connections)} total)"
+    else:
+        # Filters applied
+        title_text = f"● Guacamole Connections ({len(filtered_connections)} out of {len(connections)} match filters)"
+    
+    table = Table(
+        title=title_text,
+        title_style="bold cyan",
+        show_header=True,
+        header_style="bold magenta",
+    )
+
+    table.add_column(
+        "Connection Name", style="cyan", no_wrap=False, min_width=20, max_width=30
+    )
+    table.add_column("Host", style="green", min_width=15, max_width=25)
+    table.add_column("Protocol", style="magenta", justify="center", max_width=8)
+    table.add_column("Port", style="yellow", justify="center", max_width=6)
+    table.add_column("PVE Source", style="orange1", justify="center", max_width=12)
+    table.add_column("Sync Status", style="white", justify="center", min_width=12)
+
+    for conn in filtered_connections:
+        table.add_row(
+            conn["name"],
+            conn["hostname"],
+            conn["protocol"],
+            conn["port"],
+            conn["pve_source"],
+            conn["sync_status_rich"],
+        )
+
+    console.print(table)
+    return True
+
+
+def collect_out_of_sync_vms(
+    config: Optional[Config] = None,
+    proxmox_api: Optional[ProxmoxAPI] = None,
+    guac_api: Optional[GuacamoleAPI] = None,
+) -> List[Dict[str, Any]]:
+    """Collect VMs whose Guacamole connections are flagged as out of sync."""
+
+    cfg = config or Config()
+    prox_api = proxmox_api or ProxmoxAPI(cfg)
+    guac = guac_api or GuacamoleAPI(cfg)
+
+    results: List[Dict[str, Any]] = []
+
+    try:
+        connections = guac.get_connections() or {}
+    except Exception:
+        return results
+
+    name_to_connection: Dict[str, Dict[str, Any]] = {}
+    for conn_id, conn in connections.items():
+        name = conn.get("name")
+        if name:
+            name_to_connection[name] = {"id": conn_id, "data": conn}
+
+    detail_cache: Dict[str, Dict[str, Any]] = {}
+    default_ports = {"rdp": 3389, "ssh": 22, "vnc": 5900}
+
+    try:
+        vms = prox_api.get_vms()
+    except Exception:
+        return results
+
+    for vm in vms:
+        node_name = vm.get("node")
+        vm_id = vm.get("vmid")
+
+        if node_name is None or vm_id is None:
+            continue
+
+        try:
+            vm_config = prox_api.get_vm_config(node_name, vm_id)
+        except Exception:
+            continue
+
+        notes = vm_config.get("description", "") or vm_config.get("notes", "")
+        if notes:
+            try:
+                from urllib.parse import unquote
+
+                notes = unquote(notes)
+            except Exception:
+                pass
+
+        try:
+            parsed_creds = prox_api.parse_credentials_from_notes(
+                notes,
+                vm.get("name", ""),
+                str(vm_id),
+                node_name,
+                prompt_on_decrypt_failure=False,
+            )
+        except CredentialRecoveryPending as pending:
+            diagnostic = pending.decrypt_error.format_diagnostics()
+            results.append(
+                {
+                    "node": node_name,
+                    "vmid": vm_id,
+                    "vm": vm,
+                    "name": vm.get("name", f"VM-{vm_id}"),
+                    "issues": [
+                        "Password decryption failed — run repair to re-enter the credential.",
+                        diagnostic,
+                    ],
+                    "requires_connection_refresh": False,
+                    "requires_encryption": True,
+                    "notes": notes,
+                    "credentials": [],
+                    "requires_password_input": {
+                        "username": pending.username,
+                        "raw_line": pending.raw_line,
+                        "decrypt_error": pending.decrypt_error,
+                    },
+                }
+            )
+            continue
+
+        if not parsed_creds:
+            continue
+
+        sync_issues: List[str] = []
+        missing_connections = 0
+        existing_connections_count = 0
+        requires_refresh = False
+        augmented_creds: List[Dict[str, Any]] = []
+
+        for cred in parsed_creds:
+            cred_payload = cred.copy()
+            cred_meta: Dict[str, Any] = {
+                "payload": cred_payload,
+                "existing_identifier": None,
+                "needs_refresh": False,
+            }
+
+            connection_name = cred_payload.get("connection_name")
+            if not connection_name:
+                augmented_creds.append(cred_meta)
+                continue
+
+            existing_info = name_to_connection.get(connection_name)
+
+            if not existing_info:
+                missing_connections += 1
+                requires_refresh = True
+                sync_issues.append(f"Missing connection: {connection_name}")
+                cred_meta["needs_refresh"] = True
+            else:
+                existing_connections_count += 1
+                conn_id = existing_info["id"]
+                cred_meta["existing_identifier"] = conn_id
+
+                try:
+                    if conn_id not in detail_cache:
+                        detail_cache[conn_id] = guac.get_connection_details(conn_id)
+                    details = detail_cache.get(conn_id, {})
+                except Exception:
+                    details = {}
+
+                params = details.get("parameters") or existing_info["data"].get(
+                    "parameters", {}
+                )
+
+                existing_proto = (
+                    (details.get("protocol") or existing_info["data"].get("protocol") or "")
+                    .lower()
+                )
+                target_proto = (cred_payload.get("protocol") or "").lower()
+                expected_port = cred_payload.get("port") or default_ports.get(target_proto, "")
+
+                mismatch = False
+
+                # Only check username for protocols that use it (not VNC)
+                if target_proto != "vnc":
+                    if params.get("username") != cred_payload.get("username"):
+                        mismatch = True
+                        requires_refresh = True
+                        sync_issues.append(
+                            f"{connection_name}: username differs (Guac='{params.get('username', '')}' vs Notes='{cred_payload.get('username', '')}')"
+                        )
+
+                if params.get("port") != str(expected_port):
+                    mismatch = True
+                    requires_refresh = True
+                    sync_issues.append(
+                        f"{connection_name}: port differs (Guac='{params.get('port')}' vs Notes='{expected_port}')"
+                    )
+
+                if existing_proto and existing_proto != target_proto:
+                    mismatch = True
+                    requires_refresh = True
+                    sync_issues.append(
+                        f"{connection_name}: protocol differs (Guac='{existing_proto}' vs Notes='{target_proto}')"
+                    )
+
+                cred_meta["needs_refresh"] = mismatch
+
+            augmented_creds.append(cred_meta)
+
+        requires_encryption = False
+        try:
+            if prox_api.notes_contains_unencrypted_passwords(notes):
+                requires_encryption = True
+                sync_issues.append("Unencrypted passwords in notes")
+        except Exception:
+            pass
+
+        # Remove duplicate issue strings while preserving order
+        sync_issues = list(dict.fromkeys(sync_issues))
+
+        if missing_connections > 0 and existing_connections_count == 0 and not requires_encryption:
+            continue  # Treat as "not configured" rather than out-of-sync
+
+        if missing_connections > 0 or sync_issues:
+            vm_copy = dict(vm)
+            vm_copy.setdefault("node", node_name)
+
+            results.append(
+                {
+                    "vm": vm_copy,
+                    "node": node_name,
+                    "vmid": vm_id,
+                    "name": vm.get("name") or str(vm_id),
+                    "issues": sync_issues,
+                    "credentials": augmented_creds,
+                    "notes": notes,
+                    "requires_connection_refresh": requires_refresh,
+                    "requires_encryption": requires_encryption,
+                }
+            )
+
+    return results
+
+
+def repair_out_of_sync(
+    auto_approve: bool = False,
+    dry_run: bool = False,
+    vm_filter: Optional[str] = None,
+    config: Optional[Config] = None,
+    proxmox_api: Optional[ProxmoxAPI] = None,
+    guac_api: Optional[GuacamoleAPI] = None,
+) -> bool:
+    """Repair out-of-sync Guacamole connections based on Proxmox VM notes."""
+
+    cfg = config or Config()
+    prox_api = proxmox_api or ProxmoxAPI(cfg)
+    guac = guac_api or GuacamoleAPI(cfg)
+
+    if not getattr(guac, "auth_token", None):
+        if not guac.authenticate():
+            console.print(
+                Panel(" Failed to authenticate with Guacamole", border_style="red")
+            )
+            return False
+
+    if proxmox_api is None:
+        try:
+            if not prox_api.test_auth():
+                console.print(
+                    Panel(" Failed to authenticate with Proxmox", border_style="red")
+                )
+                return False
+        except Exception as auth_error:
+            console.print(
+                Panel(
+                    f" Failed to authenticate with Proxmox: {auth_error}",
+                    border_style="red",
+                )
+            )
+            return False
+
+    try:
+        issues = collect_out_of_sync_vms(cfg, prox_api, guac)
+    except Exception as detection_error:
+        console.print(
+            Panel(
+                f" Unable to analyze sync state: {detection_error}",
+                border_style="red",
+            )
+        )
+        return False
+
+    if vm_filter:
+        filtered: List[Dict[str, Any]] = []
+        pattern = None
+        try:
+            pattern = re.compile(vm_filter, re.IGNORECASE)
+        except re.error:
+            pattern = None
+
+        for entry in issues:
+            vm_name = entry.get("name", "")
+            vmid_str = str(entry.get("vmid", ""))
+            if pattern:
+                if pattern.search(vm_name) or pattern.search(vmid_str):
+                    filtered.append(entry)
+            else:
+                if vm_filter.lower() in vm_name.lower() or vm_filter == vmid_str:
+                    filtered.append(entry)
+
+        issues = filtered
+
+    if not issues:
+        console.print(
+            Panel(
+                " All Guacamole connections are currently in sync.",
+                border_style="green",
+            )
+        )
+        return True
+
+    summary_table = Table(
+        title=" Out-of-sync VMs",
+        title_style="bold cyan",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    summary_table.add_column("#", style="cyan", width=4)
+    summary_table.add_column("VM", style="white")
+    summary_table.add_column("VMID", style="cyan", justify="right")
+    summary_table.add_column("Node", style="yellow")
+    summary_table.add_column("Issues", style="red")
+
+    for idx, entry in enumerate(issues, start=1):
+        issue_preview = "; ".join(entry["issues"][:2])
+        if len(entry["issues"]) > 2:
+            issue_preview += " ..."
+        summary_table.add_row(
+            str(idx),
+            entry.get("name", ""),
+            str(entry.get("vmid", "")),
+            entry.get("node", ""),
+            issue_preview,
+        )
+
+    console.print(summary_table)
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode: no changes have been applied.[/yellow]")
+        return True
+
+    if not auto_approve:
+        answer = (
+            console.input(
+                "\nApply automatic repairs now? (Y/n/skip): "
+            )
+            .strip()
+            .lower()
+        )
+        if answer in ("", "y", "yes"):
+            pass
+        elif answer in ("s", "skip"):
+            console.print("[yellow]Automatic repair skipped.[/yellow]")
+            return False
+        else:
+            console.print("[yellow]Automatic repair cancelled.[/yellow]")
+            return False
+
+    total_success = 0
+    total_fail = 0
+    encrypted_count = 0
+
+    for entry in issues:
+        vm_label = f"{entry.get('name', 'VM')} (VMID {entry.get('vmid')} on {entry.get('node')})"
+        console.print(Panel(f" Repairing {vm_label}", border_style="blue"))
+
+        vm_success = True
+
+        password_requirement = entry.get("requires_password_input")
+        if password_requirement:
+            decrypt_error = password_requirement.get("decrypt_error")
+            username = password_requirement.get("username", "")
+            if isinstance(decrypt_error, PasswordDecryptionError):
+                replacement = prox_api.prompt_password_reentry(
+                    decrypt_error,
+                    username=username,
+                    vm_name=entry.get("name", ""),
+                    vm_id=str(entry.get("vmid")),
+                    vm_node=entry.get("node", ""),
+                )
+            else:
+                replacement = None
+
+            if not replacement:
+                console.print(
+                    "  [yellow]⚠ Skipping automatic repair for this VM until the password is re-entered.[/yellow]"
+                )
+                total_fail += 1
+                continue
+
+            # Update notes to temporarily include the plain-text replacement password
+            # so process_and_update_vm_notes can encrypt it properly
+            old_notes = entry.get("notes", "")
+            updated_notes_lines: List[str] = []
+            for line in old_notes.split("\n"):
+                if username and f'user:"{username}"' in line and "encrypted_password:" in line:
+                    # Remove the old encrypted_password and add the plain password
+                    line = re.sub(r'encrypted_password:"[^"]*"', "", line)
+                    line = re.sub(r"\s+", " ", line).strip()
+                    # Insert the new plain password before the semicolon
+                    line = line.rstrip(";").strip() + f' pass:"{replacement}";'
+                updated_notes_lines.append(line)
+            updated_notes_with_plain = "\n".join(updated_notes_lines)
+            entry["notes"] = updated_notes_with_plain
+
+            prox_api.cache_password_override(
+                entry.get("node", ""), str(entry.get("vmid")), username, replacement
+            )
+
+            try:
+                reparsed_creds = prox_api.parse_credentials_from_notes(
+                    entry.get("notes", ""),
+                    entry.get("name", ""),
+                    str(entry.get("vmid")),
+                    entry.get("node", ""),
+                    prompt_on_decrypt_failure=True,
+                )
+            except CredentialRecoveryPending:
+                console.print(
+                    "  [red]✗ Password re-entry failed validation; please rerun repair and provide matching credentials.[/red]"
+                )
+                vm_success = False
+                total_fail += 1
+                continue
+
+            # Rebuild credential metadata for downstream processing
+            rebuilt_creds: List[Dict[str, Any]] = []
+            name_to_identifier: Dict[Optional[str], Optional[str]] = {
+                cast(str, cred.get("connection_name")): cast(str, cred.get("existing_identifier"))
+                for cred in cast(List[Dict[str, Any]], entry.get("credentials", []))
+            }
+            for payload in reparsed_creds:
+                rebuilt_creds.append(
+                    {
+                        "connection_name": payload.get("connection_name"),
+                        "username": payload.get("username"),
+                        "password": payload.get("password"),
+                        "protocol": payload.get("protocol"),
+                        "port": payload.get("port"),
+                        "rdp_settings": payload.get("rdp_settings"),
+                        "vnc_settings": payload.get("vnc_settings"),
+                        "wol_settings": payload.get("wol_settings"),
+                        "wol_disabled": payload.get("wol_disabled"),
+                        "existing_identifier": name_to_identifier.get(
+                            payload.get("connection_name")
+                        ),
+                        "needs_refresh": True,
+                    }
+                )
+
+            entry["credentials"] = rebuilt_creds
+            entry["requires_connection_refresh"] = True
+            entry["requires_encryption"] = True
+            # Remove the password requirement flag to avoid reprocessing
+            entry.pop("requires_password_input", None)
+
+        if entry.get("requires_encryption") and entry.get("notes"):
+            try:
+                _ = prox_api.process_and_update_vm_notes(
+                    entry["node"], entry["vmid"], entry["notes"]
+                )
+                encrypted_count += 1
+                console.print(
+                    "  [green]✓ Updated VM notes with encrypted passwords[/green]"
+                )
+            except Exception as encryption_error:
+                vm_success = False
+                console.print(
+                    f"  [red]✗ Failed to update VM notes: {encryption_error}[/red]"
+                )
+
+        if entry.get("requires_connection_refresh"):
+            try:
+                current_connections = guac.get_connections() or {}
+            except Exception as fetch_error:
+                console.print(
+                    f"  [red]✗ Could not retrieve existing connections: {fetch_error}[/red]"
+                )
+                current_connections = {}
+                vm_success = False
+
+            name_to_identifier = {
+                conn.get("name"): conn_id
+                for conn_id, conn in current_connections.items()
+                if conn.get("name")
+            }
+
+            for cred in entry.get("credentials", []):
+                connection_name = cred.get("connection_name")
+                identifier = cred.get("existing_identifier")
+                if identifier is None:
+                    identifier = name_to_identifier.get(connection_name)
+
+                if identifier:
+                    try:
+                        if guac.delete_connection(identifier):
+                            console.print(
+                                f"  [yellow]• Removed outdated connection: {connection_name}[/yellow]"
+                            )
+                        else:
+                            vm_success = False
+                            console.print(
+                                f"  [red]✗ Failed to delete connection: {connection_name}[/red]"
+                            )
+                    except Exception as delete_error:
+                        vm_success = False
+                        console.print(
+                            f"  [red]✗ Error deleting {connection_name}: {delete_error}[/red]"
+                        )
+
+            allowed_keys = {
+                "username",
+                "password",
+                "protocol",
+                "connection_name",
+                "port",
+                "rdp_settings",
+                "vnc_settings",
+                "wol_settings",
+                "wol_disabled",
+            }
+
+            sanitized_credentials = [
+                {key: cred[key] for key in allowed_keys if key in cred}
+                for cred in entry.get("credentials", [])
+            ]
+
+            try:
+                if process_single_vm_auto(
+                    cfg,
+                    prox_api,
+                    guac,
+                    entry["node"],
+                    entry["vm"],
+                    sanitized_credentials,
+                ):
+                    console.print(
+                        "  [green]✓ Rebuilt Guacamole connections from Proxmox notes[/green]"
+                    )
+                else:
+                    vm_success = False
+                    console.print(
+                        "  [red]✗ Failed to rebuild connections for this VM[/red]"
+                    )
+            except Exception as rebuild_error:
+                vm_success = False
+                console.print(
+                    f"  [red]✗ Error while rebuilding connections: {rebuild_error}[/red]"
+                )
+
+        if vm_success:
+            total_success += 1
+        else:
+            total_fail += 1
+
+    console.print("\n" + "=" * 60)
+    status_style = "green" if total_fail == 0 else "yellow"
+    console.print(
+        Panel.fit(
+            " Repair complete" if total_fail == 0 else " Repair finished with warnings",
+            border_style=status_style,
+        )
+    )
+
+    summary = Table(show_header=False)
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Value", style="white", justify="right")
+
+    summary.add_row("VMs repaired", str(total_success))
+    summary.add_row("VMs with failures", str(total_fail))
+    summary.add_row("VM notes encrypted", str(encrypted_count))
+
+    console.print(summary)
+
+    if total_fail:
+        console.print(
+            "[yellow]Review the remaining issues with 'list --status out-of-sync' and rerun repair if needed.[/yellow]"
+        )
+
+    return total_fail == 0
+
+
+def autogroup_connections() -> bool:
+    """Analyze existing connections and suggest automatic groupings"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    console.print(
+        Panel.fit(
+            " Auto-Group Analysis", border_style="cyan", title="Analyzing Connections"
+        )
+    )
+
+    # Get connections and groups
+    connections = guac_api.get_connections()
+    _ = guac_api.get_connection_groups()
+
+    if not connections:
+        console.print(Panel(" No connections found to analyze.", border_style="yellow"))
+        return True
+
+    # Get connection details for analysis
+    connection_details: Dict[str, Dict[str, Any]] = {}
+    with AnimationManager("Loading connection details", style="cyan") as anim:
+        for conn_id, conn in connections.items():
+            anim.update(f"Loading {conn.get('name', 'connection')}...")
+            details = guac_api.get_connection_details(conn_id)
+            connection_details[conn_id] = {
+                "name": conn.get("name", ""),
+                "protocol": conn.get("protocol", ""),
+                "params": details.get("parameters", {}),
+                "group": conn.get("parentIdentifier"),
+            }
+
+    # Analyze connections for grouping opportunities
+    suggested_groups = analyze_connections_for_grouping(connection_details)
+
+    if not suggested_groups:
+        console.print(
+            Panel(
+                " No grouping opportunities found.\n All connections are already optimally organized.",
+                border_style="green",
+            )
+        )
+        return True
+
+    # Display enhanced suggestions
+    console.print(
+        f"\n[bold green]Found {len(suggested_groups)} intelligent grouping opportunities:[/bold green]\n"
+    )
+
+    for i, group in enumerate(suggested_groups, 1):
+        confidence_color = {"High": "green", "Medium": "yellow", "Low": "orange1"}.get(
+            group.get("confidence", "Medium"), "yellow"
+        )
+
+        console.print(
+            f"[bold cyan]{i}. Group: '{group['name']}'[/bold cyan] [dim]({group.get('strategy', 'Unknown')} Strategy)[/dim]"
+        )
+        console.print(
+            f"   [{confidence_color}]Confidence: {group.get('confidence', 'Medium')}[/{confidence_color}] | [yellow]{group['reason']}[/yellow]"
+        )
+        console.print(f"   [dim]Connections ({len(group['connections'])}):[/dim]")
+
+        for conn in group["connections"]:
+            protocol = conn["protocol"].upper()
+            hostname = conn["params"].get("hostname", "N/A")
+            # Truncate long hostnames for better display
+            if len(hostname) > 25:
+                hostname = hostname[:22] + "..."
+            console.print(f"     • {conn['name']} ({protocol}) → {hostname}")
+        console.print()
+
+    # Ask user if they want to apply suggestions
+    if not typer.confirm("\nApply these grouping suggestions?"):
+        console.print("[yellow]Grouping cancelled.[/yellow]")
+        return True
+
+    # Apply groupings
+    console.print("\n[green]Creating connection groups...[/green]")
+
+    success_count = 0
+    error_count = 0
+
+    for group in suggested_groups:
+        try:
+            # Create the group
+            group_identifier = guac_api.create_connection_group(group["name"])
+
+            if group_identifier:
+                console.print(f"[green]✓ Created group: {group['name']}[/green]")
+
+                # Move connections to the group
+                moved_count = 0
+                for conn in group["connections"]:
+                    if move_connection_to_group(guac_api, conn["id"], group_identifier):
+                        moved_count += 1
+                    else:
+                        console.print(
+                            f"[yellow]  ⚠ Could not move {conn['name']} to group[/yellow]"
+                        )
+
+                console.print(
+                    f"[dim]  Moved {moved_count}/{len(group['connections'])} connections[/dim]"
+                )
+                success_count += 1
+            else:
+                console.print(f"[red]✗ Failed to create group: {group['name']}[/red]")
+                error_count += 1
+
+        except Exception as e:
+            console.print(f"[red]✗ Error creating group {group['name']}: {e}[/red]")
+            error_count += 1
+
+    console.print(f"\n[green]Successfully created: {success_count} groups[/green]")
+    if error_count > 0:
+        console.print(f"[red]Failed to create: {error_count} groups[/red]")
+
+    console.print(
+        "\n[cyan]Grouping complete! Use 'list' command to see the new organization.[/cyan]"
+    )
+    return True
+
+
+def analyze_connections_for_grouping(connection_details: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enhanced analysis with multiple intelligent grouping strategies"""
+    suggestions: List[Dict[str, Any]] = []
+    ungrouped_connections: List[Dict[str, Any]] = []
+
+    # Find connections not already in groups
+    for conn_id, details in connection_details.items():
+        if not details["group"] or details["group"] == "ROOT":
+            ungrouped_connections.append(
+                {
+                    "id": conn_id,
+                    "name": details["name"],
+                    "protocol": details["protocol"],
+                    "params": details["params"],
+                }
+            )
+
+    if len(ungrouped_connections) < 2:
+        return []
+
+    console.print(
+        f"[dim]Analyzing {len(ungrouped_connections)} ungrouped connections...[/dim]"
+    )
+
+    # Strategy 1: Group by exact hostname/IP
+    hostname_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for conn in ungrouped_connections:
+        hostname = conn["params"].get("hostname", "")
+        if hostname:
+            if hostname not in hostname_groups:
+                hostname_groups[hostname] = []
+            hostname_groups[hostname].append(conn)
+
+    # Strategy 2: Group by hostname patterns (same subnet, similar names)
+    subnet_groups: Dict[str, List[Dict[str, Any]]] = {}
+    hostname_pattern_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for conn in ungrouped_connections:
+        hostname = conn["params"].get("hostname", "")
+        if hostname:
+            # Check if it's an IP address
+            try:
+
+                ip = ipaddress.ip_address(hostname)
+                if ip.is_private:
+                    # Group by /24 subnet
+                    subnet = str(ip).rsplit(".", 1)[0] + ".x"
+                    if subnet not in subnet_groups:
+                        subnet_groups[subnet] = []
+                    subnet_groups[subnet].append(conn)
+            except:
+                # It's a hostname, group by domain pattern
+                if "." in hostname:
+                    domain = ".".join(hostname.split(".")[1:])  # Remove first part
+                    if domain not in hostname_pattern_groups:
+                        hostname_pattern_groups[domain] = []
+                    hostname_pattern_groups[domain].append(conn)
+
+    # Strategy 3: Group by connection name patterns
+    name_pattern_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for conn in ungrouped_connections:
+        name = conn["name"].lower()
+
+        base_name = re.sub(r"[-_](rdp|ssh|vnc|http|https)(\d+)?$", "", name)
+        base_name = re.sub(r"\d+$", "", base_name).strip("-_")
+
+        if len(base_name) >= 3:  # Only consider meaningful base names
+            if base_name not in name_pattern_groups:
+                name_pattern_groups[base_name] = []
+            name_pattern_groups[base_name].append(conn)
+
+    # Strategy 4: Group by environment/purpose keywords
+    environment_groups: Dict[str, List[Dict[str, Any]]] = {
+        "production": [],
+        "prod": [],
+        "live": [],
+        "development": [],
+        "dev": [],
+        "test": [],
+        "staging": [],
+        "stage": [],
+        "database": [],
+        "db": [],
+        "sql": [],
+        "mysql": [],
+        "postgres": [],
+        "web": [],
+        "www": [],
+        "apache": [],
+        "nginx": [],
+        "mail": [],
+        "email": [],
+        "smtp": [],
+        "backup": [],
+        "storage": [],
+        "file": [],
+        "share": [],
+    }
+
+    for conn in ungrouped_connections:
+        name_lower = conn["name"].lower()
+        hostname_lower = conn["params"].get("hostname", "").lower()
+
+        for keyword in environment_groups:
+            if keyword in name_lower or keyword in hostname_lower:
+                environment_groups[keyword].append(conn)
+                break
+
+    used_connection_ids: Set[str] = set()
+
+    # Process Strategy 1: Exact hostname matches
+    for hostname, connections in hostname_groups.items():
+        if len(connections) > 1:
+            group_name = suggest_group_name_from_connections(connections, hostname)
+            suggestions.append(
+                {
+                    "name": group_name,
+                    "connections": connections,
+                    "reason": f"Same host: {hostname}",
+                    "confidence": "High",
+                    "strategy": "Hostname",
+                }
+            )
+            for conn in connections:
+                used_connection_ids.add(conn["id"])
+
+    # Process Strategy 2: Subnet grouping (only if multiple subnets exist)
+    if (
+        len(subnet_groups) > 1
+    ):  # Only suggest subnet grouping if there are multiple subnets
+        for subnet, connections in subnet_groups.items():
+            available_connections = [
+                c for c in connections if c["id"] not in used_connection_ids
+            ]
+            if len(available_connections) >= 3:  # Only suggest if 3+ connections
+                suggestions.append(
+                    {
+                        "name": f"Subnet-{subnet}",
+                        "connections": available_connections,
+                        "reason": f"Same subnet: {subnet}",
+                        "confidence": "Medium",
+                        "strategy": "Subnet",
+                    }
+                )
+                for conn in available_connections:
+                    used_connection_ids.add(conn["id"])
+
+    # Process Strategy 3: Hostname domain patterns
+    for domain, connections in hostname_pattern_groups.items():
+        available_connections = [
+            c for c in connections if c["id"] not in used_connection_ids
+        ]
+        if len(available_connections) >= 2:
+            suggestions.append(
+                {
+                    "name": f"Domain-{domain}",
+                    "connections": available_connections,
+                    "reason": f"Same domain: {domain}",
+                    "confidence": "Medium",
+                    "strategy": "Domain",
+                }
+            )
+            for conn in available_connections:
+                used_connection_ids.add(conn["id"])
+
+    # Process Strategy 4: Name pattern grouping
+    for base_name, connections in name_pattern_groups.items():
+        available_connections = [
+            c for c in connections if c["id"] not in used_connection_ids
+        ]
+        if len(available_connections) >= 2:
+            suggestions.append(
+                {
+                    "name": base_name.title(),
+                    "connections": available_connections,
+                    "reason": f"Similar names: {base_name}*",
+                    "confidence": "High",
+                    "strategy": "Name Pattern",
+                }
+            )
+            for conn in available_connections:
+                used_connection_ids.add(conn["id"])
+
+    # Process Strategy 5: Environment/purpose grouping
+    for env_type, connections in environment_groups.items():
+        available_connections = [
+            c for c in connections if c["id"] not in used_connection_ids
+        ]
+        if len(available_connections) >= 2:
+            suggestions.append(
+                {
+                    "name": f"{env_type.title()}-Servers",
+                    "connections": available_connections,
+                    "reason": f"Environment type: {env_type}",
+                    "confidence": "Medium",
+                    "strategy": "Environment",
+                }
+            )
+            for conn in available_connections:
+                used_connection_ids.add(conn["id"])
+
+    # Sort suggestions by confidence and number of connections
+    confidence_scores = {"High": 3, "Medium": 2, "Low": 1}
+    suggestions.sort(
+        key=lambda x: (
+            confidence_scores.get(x["confidence"], 0),
+            len(x["connections"]),
+        ),
+        reverse=True,
+    )
+
+    return suggestions
+
+
+def suggest_group_name_from_connections(connections: List[Dict[str, Any]], hostname: str) -> str:
+    """Suggest a meaningful group name from connection names and hostname"""
+    names = [conn["name"] for conn in connections]
+
+    # Try to find common prefix
+    if len(names) > 1:
+        common_prefix = cast(str, os.path.commonprefix(names).strip("-_"))
+        if len(common_prefix) >= 3:
+            return common_prefix
+
+    # Try to extract hostname or meaningful part
+    try:
+
+        resolved_name = socket.gethostbyaddr(hostname)[0]
+        if resolved_name and "." in resolved_name:
+            return resolved_name.split(".")[0]
+    except:
+        pass
+
+    # Use the hostname or a cleaned version of the first connection name
+    if (
+        hostname
+        and not hostname.startswith("192.168.")
+        and not hostname.startswith("10.")
+    ):
+        return hostname
+
+    # Fall back to cleaned first connection name
+    first_name = cast(str, names[0])
+    # Remove common suffixes
+    for suffix in ["-rdp", "-ssh", "-vnc", "_rdp", "_ssh", "_vnc"]:
+        if first_name.lower().endswith(suffix):
+            return first_name[: -len(suffix)]
+
+    return first_name
+
+
+def find_name_pattern_groups(connections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Find connections that should be grouped based on name patterns"""
+    suggestions: List[Dict[str, Any]] = []
+
+    # Group by base name (removing protocol suffixes)
+    base_name_groups: Dict[str, List[Dict[str, Any]]] = {}
+
+    for conn in connections:
+        base_name = extract_base_name(conn["name"])
+        if base_name not in base_name_groups:
+            base_name_groups[base_name] = []
+        base_name_groups[base_name].append(conn)
+
+    # Suggest groups for base names with multiple connections
+    for base_name, conns in base_name_groups.items():
+        if len(conns) > 1:
+            suggestions.append(
+                {
+                    "name": base_name,
+                    "connections": conns,
+                    "reason": f"Similar naming pattern (base: {base_name})",
+                }
+            )
+
+    return suggestions
+
+
+def extract_base_name(connection_name: str) -> str:
+    """Extract base name by removing common protocol and user suffixes"""
+    name = connection_name.lower()
+
+    # Remove common patterns
+    patterns_to_remove = [
+        r"-rdp$",
+        r"_rdp$",
+        r"\.rdp$",
+        r"-ssh$",
+        r"_ssh$",
+        r"\.ssh$",
+        r"-vnc$",
+        r"_vnc$",
+        r"\.vnc$",
+        r"-\d+$",  # Remove port numbers
+        r":\d+$",  # Remove :port
+    ]
+
+    for pattern in patterns_to_remove:
+        name = re.sub(pattern, "", name)
+
+    # Remove user@ prefix
+    if "@" in name:
+        name = name.split("@")[1]
+
+    return name.strip("-_.")
+
+
+def move_connection_to_group(guac_api: Any, connection_id: str, group_identifier: str) -> Any:
+    """Move a connection to a specific group"""
+    return guac_api.move_connection_to_group(connection_id, group_identifier)
+
+
+def delete_connections_interactive() -> bool:
+    """Interactive deletion mode for connections and groups"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    # Get connections and groups
+    connections = guac_api.get_connections()
+    groups = guac_api.get_connection_groups()
+
+    if not connections and not groups:
+        console.print(
+            Panel(" No connections or groups found to delete.", border_style="yellow")
+        )
+        return True
+
+    # Prepare items for selection
+    items: List[Dict[str, Any]] = []
+
+    # Add connections
+    for conn_id, conn in connections.items():
+        name = conn.get("name", "N/A")
+        protocol = conn.get("protocol", "N/A")
+        items.append(
+            {
+                "type": "connection",
+                "id": conn_id,
+                "name": name,
+                "display": f"[Connection] {name} ({protocol.upper()})",
+                "selected": False,
+            }
+        )
+
+    # Add connection groups
+    for group_id, group in groups.items():
+        name = group.get("name", "N/A")
+        items.append(
+            {
+                "type": "group",
+                "id": group_id,
+                "name": name,
+                "display": f"[Group] {name}",
+                "selected": False,
+            }
+        )
+
+    if not items:
+        console.print(Panel(" No items available for deletion.", border_style="yellow"))
+        return True
+
+    console.print(
+        Panel.fit(
+            " Delete Connections & Groups", border_style="red", title="Delete Mode"
+        )
+    )
+    console.print(
+        "\n[yellow]Use SPACE to select/deselect items, ENTER to confirm deletion, ESC or Ctrl+C to cancel[/yellow]\n"
+    )
+
+    current_index = 0
+
+    termios_module = None
+    tty_module = None
+    has_termios = False
+    try:
+        import tty as tty_module  # type: ignore
+        import termios as termios_module  # type: ignore
+
+        has_termios = True
+    except ImportError:
+        has_termios = False
+
+    try:
+        while True:
+            # Clear screen and show selection
+            console.clear()
+            console.print(
+                Panel.fit(
+                    " Delete Connections & Groups",
+                    border_style="red",
+                    title="Delete Mode",
+                )
+            )
+            console.print(
+                "\n[yellow]Use SPACE to select/deselect, ENTER to delete selected, ESC/Ctrl+C to cancel[/yellow]\n"
+            )
+
+            # Show items with selection state
+            for i, item in enumerate(items):
+                prefix = ">" if i == current_index else " "
+                checkbox = "[x]" if item["selected"] else "[ ]"
+                style = "bold red" if item["selected"] else "white"
+                highlight = "on blue" if i == current_index else ""
+
+                console.print(
+                    f"{prefix} {checkbox} [{style} {highlight}]{item['display']}[/{style} {highlight}]"
+                )
+
+            selected_count = sum(1 for item in items if item["selected"])
+            if selected_count > 0:
+                console.print(
+                    f"\n[red]{selected_count} item(s) selected for deletion[/red]"
+                )
+            
+            if not has_termios:
+                # Windows fallback - simple input
+                try:
+                    choice = input("\nPress 's' to select/deselect, 'd' to delete, or 'q' to quit: ").strip().lower()
+                    if choice == 'q':
+                        console.print("\n[yellow]Delete cancelled.[/yellow]")
+                        return True
+                    elif choice == 'd':
+                        # Proceed to delete selected items
+                        selected_items = [item for item in items if item["selected"]]
+                        if selected_items:
+                            break
+                        console.print("\n[yellow]No items selected for deletion.[/yellow]")
+                    elif choice == 's' and items:
+                        # Toggle selection of first item (simple fallback)
+                        items[0]["selected"] = not items[0]["selected"]
+                    continue
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[yellow]Delete cancelled.[/yellow]")
+                    return True
+
+            fd = sys.stdin.fileno()
+            old_settings = termios_module.tcgetattr(fd)  # type: ignore[attr-defined]
+
+            try:
+                tty_module.setraw(sys.stdin.fileno())  # type: ignore[attr-defined]
+                ch = sys.stdin.read(1)
+
+                if ch == "\x1b":  # ESC sequence
+                    ch2 = sys.stdin.read(1)
+                    if ch2 == "[":
+                        ch3 = sys.stdin.read(1)
+                        if ch3 == "A":  # Up arrow
+                            current_index = max(0, current_index - 1)
+                        elif ch3 == "B":  # Down arrow
+                            current_index = min(len(items) - 1, current_index + 1)
+                    else:
+                        # ESC pressed, cancel
+                        console.print("\n[yellow]Delete cancelled.[/yellow]")
+                        return True
+                elif ch == " ":  # Space - toggle selection
+                    items[current_index]["selected"] = not items[current_index][
+                        "selected"
+                    ]
+                elif ch in ("\r", "\n"):  # Enter - confirm deletion
+                    selected_items = [item for item in items if item["selected"]]
+                    if selected_items:
+                        break
+                    console.print("\n[yellow]No items selected for deletion.[/yellow]")
+                    input("Press Enter to continue...")
+                elif ch == "\x03":  # Ctrl+C
+                    console.print("\n[yellow]Delete cancelled.[/yellow]")
+                    return True
+
+            finally:
+                tcs_drain = getattr(termios_module, "TCSADRAIN", 0)
+                termios_module.tcsetattr(fd, tcs_drain, old_settings)  # type: ignore[attr-defined]
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Delete cancelled.[/yellow]")
+        return True
+
+    # Confirm deletion
+    selected_items = [item for item in items if item["selected"]]
+    if not selected_items:
+        console.print("\n[yellow]No items selected for deletion.[/yellow]")
+        return True
+
+    console.clear()
+    console.print("\n[red bold]⚠ CONFIRM DELETION ⚠[/red bold]")
+    console.print("\nThe following items will be permanently deleted:")
+
+    for item in selected_items:
+        console.print(f"  • {item['display']}")
+
+    confirm = Prompt.ask(
+        f"\n[red]Type 'DELETE' to confirm deletion of {len(selected_items)} item(s)[/red]"
+    ).strip()
+
+    if confirm != "DELETE":
+        console.print(
+            "\n[yellow]Deletion cancelled - confirmation text did not match.[/yellow]"
+        )
+        return True
+
+    # Perform deletions
+    console.print("\n[red]Deleting selected items...[/red]")
+
+    success_count = 0
+    error_count = 0
+
+    for item in selected_items:
+        try:
+            if item["type"] == "connection":
+                if guac_api.delete_connection(item["id"]):
+                    console.print(
+                        f"[green]✓ Deleted connection: {item['name']}[/green]"
+                    )
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete connection: {item['name']}[/red]"
+                    )
+                    error_count += 1
+            elif item["type"] == "group":
+                if guac_api.delete_connection_group(item["id"]):
+                    console.print(f"[green]✓ Deleted group: {item['name']}[/green]")
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete group: {item['name']}[/red]"
+                    )
+                    error_count += 1
+        except Exception as e:
+            console.print(f"[red]✗ Error deleting {item['name']}: {e}[/red]")
+            error_count += 1
+
+    console.print(f"\n[green]Successfully deleted: {success_count}[/green]")
+    if error_count > 0:
+        console.print(f"[red]Failed deletions: {error_count}[/red]")
+
+    input("\nPress Enter to continue...")
+    return True
+
+
+def _build_connection_to_vm_mapping(
+    config: Config, guac_api: GuacamoleAPI
+) -> Dict[str, Tuple[str, int]]:
+    """Build mapping from connection name to Proxmox VM info (node, vmid).
+
+    Returns:
+        Dict mapping connection name to (node_name, vm_id) tuple
+    """
+    connection_to_vm_info: Dict[str, Tuple[str, int]] = {}
+
+    try:
+        proxmox_api = ProxmoxAPI(config)
+        all_vms = proxmox_api.get_vms()
+
+        # Group VMs by node
+        vms_by_node: Dict[str, List[Dict[str, Any]]] = {}
+        for vm in all_vms:
+            node_name = vm.get("node")
+            if node_name:
+                if node_name not in vms_by_node:
+                    vms_by_node[node_name] = []
+                vms_by_node[node_name].append(vm)
+
+        # Build connection name to VM mapping
+        for node_name, vms in vms_by_node.items():
+            for vm in vms:
+                vm_id = vm.get("vmid")
+                vm_name = vm.get("name", "")
+
+                if vm_id is not None:
+                    try:
+                        vm_config = proxmox_api.get_vm_config(node_name, vm_id)
+                        notes = vm_config.get("description", "")
+
+                        if notes:
+                            try:
+                                parsed_creds = proxmox_api.parse_credentials_from_notes(
+                                    notes,
+                                    vm_name,
+                                    str(vm_id),
+                                    node_name,
+                                    prompt_on_decrypt_failure=False,
+                                )
+                            except CredentialRecoveryPending:
+                                parsed_creds = []
+
+                            for cred in parsed_creds:
+                                connection_name = cred.get("connection_name")
+                                if connection_name and vm_id is not None:
+                                    connection_to_vm_info[connection_name] = (
+                                        node_name,
+                                        vm_id,
+                                    )
+                    except Exception:
+                        continue
+    except Exception:
+        # If Proxmox is not accessible, return empty mapping
+        pass
+
+    return connection_to_vm_info
+
+
+def _ensure_proxmox_vm_running(
+    config: Config,
+    proxmox_api: ProxmoxAPI,
+    node_name: str,
+    vm_id: int,
+    connection_name: str,
+    timeout: float,
+) -> Tuple[bool, str]:
+    """Ensure Proxmox VM is running, starting it if necessary.
+
+    Args:
+        config: Configuration object
+        proxmox_api: ProxmoxAPI instance
+        node_name: Proxmox node name
+        vm_id: VM ID
+        connection_name: Connection name for display
+        timeout: Base timeout for connectivity test
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    try:
+        # Check VM status
+        vm_status = proxmox_api.get_vm_status(node_name, vm_id)
+        status = vm_status.get("status", "unknown")
+
+        # Only start VM if it's actually stopped
+        if status == "running":
+            # VM is already running, no action needed
+            if verbose_mode:
+                if raw_mode:
+                    print(f"VM {vm_id} is already running, skipping start")
+                else:
+                    console.print(
+                        f"[dim]⬢ VM {vm_id} is already running, skipping start[/dim]"
+                    )
+            return True, ""
+
+        # VM is not running (stopped, paused, etc.), use Wake-on-LAN
+        if raw_mode:
+            print(f"VM status: '{status}' - Attempting Wake-on-LAN for VM {vm_id} on node {node_name} (connection '{connection_name}')...")
+        else:
+            console.print(
+                f"[yellow]⬢ VM status: '{status}' - Attempting Wake-on-LAN for VM {vm_id} on node {node_name} (connection '{connection_name}')...[/yellow]"
+            )
+
+        # Get VM's MAC address from network configuration
+        vm_network_info = proxmox_api.get_vm_network_info(node_name, vm_id)
+        if not vm_network_info:
+            return False, "Could not retrieve VM network info for WoL"
+
+        # Get the first MAC address
+        mac_address = None
+        for net_if in vm_network_info:
+            mac = net_if.get("mac")
+            if mac:
+                mac_address = mac
+                break
+
+        if not mac_address:
+            return False, "No MAC address found for WoL"
+
+        # Send WoL packet
+        if raw_mode:
+            print(f"Sending Wake-on-LAN packet to MAC {mac_address}...")
+        else:
+            console.print(
+                f"[cyan]⬢ Sending Wake-on-LAN packet to MAC {mac_address}...[/cyan]"
+            )
+
+        if not WakeOnLan.send_wol_packet(mac_address):
+            return False, "Failed to send WoL packet"
+
+        # Wait for VM to boot after WoL with extended timeout
+        boot_timeout = getattr(config, 'PROXMOX_VM_BOOT_TIMEOUT', 120)
+        check_interval = getattr(config, 'PROXMOX_VM_BOOT_CHECK_INTERVAL', 5)
+        elapsed = 0
+
+        if raw_mode:
+            print(f"Waiting up to {boot_timeout}s for VM to boot after WoL (checking every {check_interval}s)...")
+        else:
+            console.print(
+                f"[cyan]⬢ Waiting up to {boot_timeout}s for VM to boot after WoL (checking every {check_interval}s)...[/cyan]"
+            )
+
+        while elapsed < boot_timeout:
+            time.sleep(check_interval)
+            elapsed += check_interval
+
+            vm_status = proxmox_api.get_vm_status(node_name, vm_id)
+            status = vm_status.get("status", "unknown")
+
+            if status == "running":
+                # Give it a bit more time for network services to start
+                time.sleep(5)
+
+                if raw_mode:
+                    print(f"VM woke up and is now running (took {elapsed}s after WoL)")
+                else:
+                    console.print(
+                        f"[green]✓ VM woke up and is now running (took {elapsed}s after WoL)[/green]"
+                    )
+                return True, ""
+
+            if not raw_mode and elapsed % 10 == 0:
+                console.print(f"[dim]Still waiting... ({elapsed}/{boot_timeout}s)[/dim]")
+
+        return False, f"VM boot timeout after {boot_timeout}s (WoL may have failed or VM boot is slow)"
+
+    except Exception as e:
+        return False, f"Error during WoL wake-up: {str(e)}"
+
+
+def interactive_connectivity_test() -> None:
+    """Interactive connectivity testing with filtering options"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel("⬢ Failed to authenticate with Guacamole", border_style="red")
+        )
+        return
+
+    console.print(
+        Panel.fit(
+            "⬢ Connection Connectivity Test",
+            border_style="cyan",
+            title="Test Configuration",
+        )
+    )
+
+    # Get filter options
+    console.print("\n[bold]Test Configuration:[/bold]\n")
+
+    # Connection pattern with optional input
+    connection_pattern = Prompt.ask(
+        "[cyan]Connection name pattern (regex)[/cyan]",
+        default="",
+        show_default=False
+    ).strip()
+    if not connection_pattern:
+        connection_pattern = None
+
+    # Protocol filter with arrow key selection (works on Windows!)
+    protocol_filter = questionary.select(
+        "Protocol filter:",
+        choices=["All protocols", "RDP only", "SSH only", "VNC only"],
+        default="All protocols",
+        style=questionary.Style([
+            ('qmark', 'fg:cyan bold'),
+            ('question', 'fg:cyan bold'),
+            ('answer', 'fg:green bold'),
+            ('pointer', 'fg:cyan bold'),
+            ('highlighted', 'fg:cyan bold'),
+            ('selected', 'fg:green'),
+        ])
+    ).ask()
+
+    # Convert to filter value
+    if protocol_filter == "RDP only":
+        protocol_filter = "rdp"
+    elif protocol_filter == "SSH only":
+        protocol_filter = "ssh"
+    elif protocol_filter == "VNC only":
+        protocol_filter = "vnc"
+    else:
+        protocol_filter = None
+
+    # Test authentication (graphical yes/no with arrow keys)
+    test_auth = questionary.confirm(
+        "Test actual protocol authentication?",
+        default=True,
+        style=questionary.Style([
+            ('qmark', 'fg:cyan bold'),
+            ('question', 'fg:cyan bold'),
+            ('answer', 'fg:green bold'),
+        ])
+    ).ask()
+
+    # Timeout with float input
+    timeout = FloatPrompt.ask(
+        "[cyan]Connection timeout in seconds[/cyan]",
+        default=5.0,
+        show_default=True
+    )
+
+    # Verbose output (graphical yes/no with arrow keys)
+    verbose = questionary.confirm(
+        "Verbose output for failures?",
+        default=False,
+        style=questionary.Style([
+            ('qmark', 'fg:cyan bold'),
+            ('question', 'fg:cyan bold'),
+            ('answer', 'fg:green bold'),
+        ])
+    ).ask()
+
+    # Ask about Proxmox VM auto-start (graphical yes/no with arrow keys)
+    auto_start_vms = questionary.confirm(
+        "Auto-start stopped Proxmox VMs during test?",
+        default=True,
+        style=questionary.Style([
+            ('qmark', 'fg:cyan bold'),
+            ('question', 'fg:cyan bold'),
+            ('answer', 'fg:green bold'),
+        ])
+    ).ask()
+
+    console.print("\n[dim]Starting connectivity test...[/dim]\n")
+
+    # Get all connections
+    connections = guac_api.get_connections()
+
+    if not connections:
+        console.print("[yellow]No connections found[/yellow]")
+        console.input("\n[dim]Press Enter to continue...[/dim]")
+        return
+
+    # Build connection-to-VM mapping for Proxmox VMs
+    connection_to_vm_info: Dict[str, Tuple[str, int]] = {}
+    proxmox_api = None
+    if auto_start_vms:
+        console.print("[dim]Building Proxmox VM mapping...[/dim]")
+        connection_to_vm_info = _build_connection_to_vm_mapping(config, guac_api)
+        if connection_to_vm_info:
+            console.print(
+                f"[dim]Found {len(connection_to_vm_info)} Proxmox-managed connections[/dim]"
+            )
+            proxmox_api = ProxmoxAPI(config)
+
+    # Filter connections and fetch detailed parameters
+    filtered_connections = []
+    console.print(f"\n[dim]Fetching connection details...[/dim]\n")
+
+    for conn_id, conn_data in connections.items():
+        conn_name = conn_data.get("name", "")
+        conn_protocol = conn_data.get("protocol", "")
+
+        # Apply filters
+        if connection_pattern:
+            if not re.search(connection_pattern, conn_name, re.IGNORECASE):
+                continue
+
+        if protocol_filter:
+            if conn_protocol.lower() != protocol_filter.lower():
+                continue
+
+        # Fetch detailed connection parameters
+        detailed_conn = guac_api.get_connection_details(conn_id)
+        if detailed_conn:
+            filtered_connections.append((conn_id, detailed_conn))
+        else:
+            # Fallback to basic data if details fetch fails
+            filtered_connections.append((conn_id, conn_data))
+
+    if not filtered_connections:
+        console.print("[yellow]No connections match the specified filters[/yellow]")
+        console.input("\n[dim]Press Enter to continue...[/dim]")
+        return
+
+    test_mode = "Protocol Authentication" if test_auth else "Socket Connectivity"
+    console.print(f"[bold]Testing {len(filtered_connections)} connection(s) - Mode: {test_mode}[/bold]\n")
+
+    # Test each connection
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Testing connections...", total=len(filtered_connections))
+
+        for conn_id, conn_data in filtered_connections:
+            conn_name = conn_data.get("name", "Unknown")
+            conn_protocol = conn_data.get("protocol", "unknown")
+            parameters = conn_data.get("parameters", {})
+
+            # Extract connection parameters with fallbacks for different Guacamole versions
+            hostname = parameters.get("hostname") or parameters.get("host") or ""
+            port = parameters.get("port") or ""
+            username = parameters.get("username") or parameters.get("user") or ""
+            password = parameters.get("password") or parameters.get("passwd") or ""
+
+            # If parameters are missing, try to get from top-level connection data
+            if not hostname:
+                hostname = conn_data.get("hostname", "")
+            if not port:
+                port = conn_data.get("port", "")
+            if not username:
+                username = conn_data.get("username", "")
+
+            progress.update(task, description=f"Testing {conn_name}...")
+
+            # Check if this is a Proxmox VM and ensure it's running
+            if auto_start_vms and conn_name in connection_to_vm_info and proxmox_api:
+                node_name, vm_id = connection_to_vm_info[conn_name]
+                vm_start_success, vm_start_error = _ensure_proxmox_vm_running(
+                    config, proxmox_api, node_name, vm_id, conn_name, timeout
+                )
+                if not vm_start_success:
+                    # VM couldn't be woken via WoL, record error and skip
+                    results.append({
+                        "name": conn_name,
+                        "protocol": conn_protocol,
+                        "hostname": hostname,
+                        "port": port,
+                        "username": username,
+                        "success": False,
+                        "latency_ms": None,
+                        "error": vm_start_error,
+                        "auth_result": "WoL Failed"
+                    })
+                    progress.advance(task)
+                    continue
+
+            # Test connectivity
+            success = False
+            error_msg = ""
+            latency_ms = None
+            auth_result = "N/A"
+
+            if hostname and port:
+                try:
+                    # Convert port to int, handling string values
+                    try:
+                        port_int = int(port)
+                        if port_int <= 0 or port_int > 65535:
+                            raise ValueError(f"Invalid port number: {port_int}")
+                    except (ValueError, TypeError) as port_err:
+                        error_msg = f"Invalid port value: {port}"
+                        auth_result = "Config Error"
+                        results.append({
+                            "name": conn_name,
+                            "protocol": conn_protocol,
+                            "hostname": hostname,
+                            "port": port,
+                            "username": username,
+                            "success": False,
+                            "latency_ms": None,
+                            "error": error_msg,
+                            "auth_result": auth_result
+                        })
+                        progress.advance(task)
+                        continue
+
+                    start_time = time.time()
+
+                    if test_auth:
+                        # Protocol-specific authentication tests
+                        if conn_protocol.lower() == "ssh":
+                            success, error_msg = _test_ssh_connection(
+                                hostname, port_int, username, password, timeout
+                            )
+                            auth_result = "Auth OK" if success else "Auth Failed"
+                        elif conn_protocol.lower() == "rdp":
+                            success, error_msg = _test_rdp_connection(
+                                hostname, port_int, username, password, timeout
+                            )
+                            auth_result = "Auth OK" if success else "Auth Failed"
+                        elif conn_protocol.lower() == "vnc":
+                            success, error_msg = _test_vnc_connection(
+                                hostname, port_int, password, timeout
+                            )
+                            auth_result = "Auth OK" if success else "Auth Failed"
+                        else:
+                            # Fallback to socket test for unknown protocols
+                            success, error_msg = _test_socket_connection(
+                                hostname, port_int, timeout
+                            )
+                            auth_result = "Port Open" if success else "Port Closed"
+                    else:
+                        # Socket-only test
+                        success, error_msg = _test_socket_connection(
+                            hostname, port_int, timeout
+                        )
+                        auth_result = "Port Open" if success else "Port Closed"
+
+                    end_time = time.time()
+                    latency_ms = round((end_time - start_time) * 1000, 2)
+
+                except socket.timeout:
+                    error_msg = f"Timeout after {timeout}s"
+                    auth_result = "Timeout"
+                except socket.gaierror:
+                    error_msg = "DNS resolution failed"
+                    auth_result = "DNS Error"
+                except Exception as e:
+                    error_msg = str(e)
+                    auth_result = "Error"
+            else:
+                error_msg = "Missing hostname or port"
+                auth_result = "Config Error"
+
+            results.append({
+                "name": conn_name,
+                "protocol": conn_protocol,
+                "hostname": hostname,
+                "port": port,
+                "username": username,
+                "success": success,
+                "latency_ms": latency_ms,
+                "error": error_msg,
+                "auth_result": auth_result
+            })
+
+            progress.advance(task)
+
+    # Display results
+    console.print("\n[bold]● Connectivity Test Results[/bold]\n")
+
+    # Create summary table
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Connection", style="white", no_wrap=False)
+    table.add_column("Protocol", style="cyan", justify="center")
+    table.add_column("Endpoint", style="yellow")
+    table.add_column("Status", justify="center")
+    table.add_column("Auth", justify="center")
+    table.add_column("Latency", justify="right")
+
+    success_count = 0
+    fail_count = 0
+
+    for result in results:
+        status_icon = "✓" if result["success"] else "✗"
+        status_color = "green" if result["success"] else "red"
+
+        endpoint = f"{result['hostname']}:{result['port']}" if result['hostname'] else "N/A"
+
+        auth_status = result.get('auth_result', 'N/A')
+        auth_color = "green" if result['success'] else "red" if "Failed" in auth_status else "yellow"
+
+        latency_str = ""
+        if result['success'] and result['latency_ms'] is not None:
+            latency_str = f"{result['latency_ms']}ms"
+        elif result['error']:
+            latency_str = f"[dim]{result['error'][:30]}[/dim]"
+
+        table.add_row(
+            result['name'],
+            result['protocol'].upper(),
+            endpoint,
+            f"[{status_color}]{status_icon}[/{status_color}]",
+            f"[{auth_color}]{auth_status}[/{auth_color}]",
+            latency_str
+        )
+
+        if result['success']:
+            success_count += 1
+        else:
+            fail_count += 1
+
+    console.print(table)
+
+    # Summary
+    console.print(f"\n[bold]Summary:[/bold]")
+    console.print(f"  [green]✓[/green] Successful: {success_count}")
+    console.print(f"  [red]✗[/red] Failed: {fail_count}")
+    console.print(f"  Total tested: {len(results)}")
+
+    # Verbose output
+    if verbose and fail_count > 0:
+        console.print("\n[bold]Failed Connection Details:[/bold]")
+        for result in results:
+            if not result['success']:
+                auth_color = "red" if "Failed" in result.get('auth_result', '') else "yellow"
+                console.print(f"\n[yellow]● {result['name']}[/yellow]")
+                console.print(f"  Protocol: {result['protocol'].upper()}")
+                console.print(f"  Endpoint: {result['hostname']}:{result['port']}")
+                console.print(f"  Username: {result.get('username', 'N/A')}")
+                console.print(f"  Auth Status: [{auth_color}]{result.get('auth_result', 'N/A')}[/{auth_color}]")
+                console.print(f"  Error: [red]{result['error']}[/red]")
+
+    console.input("\n[dim]Press Enter to continue...[/dim]")
+
+
+def edit_connections_interactive() -> bool:
+    """Interactive edit and delete mode for connections and groups"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    # Get connections and groups
+    connections = guac_api.get_connections()
+    groups = guac_api.get_connection_groups()
+
+    if not connections and not groups:
+        console.print(
+            Panel(" No connections or groups found to edit.", border_style="yellow")
+        )
+        return True
+
+    # Prepare items for selection
+    items: List[Dict[str, Any]] = []
+
+    # Add connections
+    for conn_id, conn in connections.items():
+        name = conn.get("name", "N/A")
+        protocol = conn.get("protocol", "N/A")
+        items.append(
+            {
+                "type": "connection",
+                "id": conn_id,
+                "name": name,
+                "protocol": protocol,
+                "display": f"[Connection] {name} ({protocol.upper()})",
+                "connection_data": conn,
+            }
+        )
+
+    # Add connection groups
+    for group_id, group in groups.items():
+        name = group.get("name", "N/A")
+        items.append(
+            {
+                "type": "group",
+                "id": group_id,
+                "name": name,
+                "display": f"[Group] {name}",
+                "connection_data": group,
+            }
+        )
+
+    if not items:
+        console.print(Panel(" No items available for editing.", border_style="yellow"))
+        return True
+
+    console.print(
+        Panel.fit(
+            " Edit Connections & Groups", border_style="orange1", title="Edit Mode"
+        )
+    )
+    console.print(
+        "\n[yellow]Use UP/DOWN arrows to navigate, ENTER to select, ESC or Ctrl+C to cancel[/yellow]\n"
+    )
+
+    current_index = 0
+
+    termios_module = None
+    tty_module = None
+    has_termios = False
+    try:
+        import tty as tty_module  # type: ignore
+        import termios as termios_module  # type: ignore
+
+        has_termios = True
+    except ImportError:
+        has_termios = False
+
+    has_msvcrt = False
+    msvcrt_module = None
+    try:
+        import msvcrt as msvcrt_module  # type: ignore
+
+        has_msvcrt = True
+    except ImportError:
+        has_msvcrt = False
+
+    selected_item = None
+
+    try:
+        while True:
+            # Clear screen and show selection
+            console.clear()
+            console.print(
+                Panel.fit(
+                    " Edit Connections & Groups",
+                    border_style="orange1",
+                    title="Edit Mode",
+                )
+            )
+            console.print(
+                "\n[yellow]Use UP/DOWN to navigate (or type row number), ENTER to select item, Q/ESC/Ctrl+C to cancel[/yellow]\n"
+            )
+
+            # Show items with current selection and row numbers
+            for i, item in enumerate(items):
+                prefix = ">" if i == current_index else " "
+                row_text = Text(f"{prefix} {i + 1:>2}. {item['display']}")
+                if i == current_index:
+                    row_text.stylize("bold white on blue")
+                console.print(row_text)
+
+            if has_termios and termios_module and tty_module:
+                fd = sys.stdin.fileno()
+                old_settings = termios_module.tcgetattr(fd)  # type: ignore[attr-defined]
+
+                try:
+                    tty_module.setraw(fd)  # type: ignore[attr-defined]
+                    ch = sys.stdin.read(1)
+
+                    if ch == "\x1b":  # ESC sequence
+                        ch2 = sys.stdin.read(1)
+                        if ch2 == "[":
+                            ch3 = sys.stdin.read(1)
+                            if ch3 == "A":  # Up arrow
+                                current_index = max(0, current_index - 1)
+                            elif ch3 == "B":  # Down arrow
+                                current_index = min(len(items) - 1, current_index + 1)
+                            continue
+                        # ESC pressed (without bracket) -> cancel
+                        console.print("\n[yellow]Edit cancelled.[/yellow]")
+                        return True
+
+                    if ch in ("\r", "\n"):  # Enter - select item to edit
+                        selected_item = items[current_index]
+                        break
+
+                    if ch in ("q", "Q", "\x03"):  # Q or Ctrl+C
+                        console.print("\n[yellow]Edit cancelled.[/yellow]")
+                        return True
+
+                    # Any other key simply refreshes the menu
+                    continue
+                finally:
+                    tcs_drain = getattr(termios_module, "TCSADRAIN", 0)
+                    termios_module.tcsetattr(  # type: ignore[attr-defined]
+                        fd, tcs_drain, old_settings
+                    )
+
+            elif has_msvcrt and msvcrt_module:
+                ch = msvcrt_module.getwch()
+
+                if ch in ("\x1b", "q", "Q"):  # Escape or Q
+                    console.print("\n[yellow]Edit cancelled.[/yellow]")
+                    return True
+
+                if ch in ("\r", "\n"):  # Enter
+                    selected_item = items[current_index]
+                    break
+
+                if ch in ("\x00", "\xe0"):  # Arrow key prefix
+                    ch2 = msvcrt_module.getwch()
+                    if ch2 == "H":  # Up arrow
+                        current_index = max(0, current_index - 1)
+                    elif ch2 == "P":  # Down arrow
+                        current_index = min(len(items) - 1, current_index + 1)
+                    continue
+
+                if ch == "\x03":  # Ctrl+C
+                    console.print("\n[yellow]Edit cancelled.[/yellow]")
+                    return True
+
+                # Ignore other keys and refresh
+                continue
+
+            else:
+                try:
+                    raw_choice = input(
+                        "\nEnter the row number to edit (or 'q' to quit): "
+                    ).strip()
+                    if not raw_choice:
+                        continue
+                    if raw_choice.lower() in ("q", "quit", "exit"):
+                        console.print("\n[yellow]Edit cancelled.[/yellow]")
+                        return True
+
+                    index_choice = int(raw_choice) - 1
+                    if 0 <= index_choice < len(items):
+                        selected_item = items[index_choice]
+                        break
+                    console.print("[yellow]Invalid selection. Try again.[/yellow]")
+                except ValueError:
+                    console.print(
+                        "[yellow]Please enter a valid number or 'q' to cancel.[/yellow]"
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[yellow]Edit cancelled.[/yellow]")
+                    return True
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Edit cancelled.[/yellow]")
+        return True
+
+    # Show edit options for selected item
+    selected_item = selected_item or items[current_index]
+
+    console.clear()
+    console.print(
+        f"\n[bold orange1]Selected Item: {selected_item['display']}[/bold orange1]\n"
+    )
+
+    # Show edit options
+    if selected_item["type"] == "connection":
+        action_choice = (
+            console.input(
+                "[bold]Available actions:[/bold]\n"
+                "  [cyan]e[/cyan] - Edit connection parameters\n"
+                "  [red]d[/red] - Delete connection\n"
+                "  [yellow]c[/yellow] - Cancel\n\n"
+                "Choose action (e/d/c): "
+            )
+            .strip()
+            .lower()
+        )
+
+        if action_choice == "e":
+            return edit_single_connection(guac_api, selected_item)
+        if action_choice == "d":
+            return delete_single_item(guac_api, selected_item)
+        console.print("[yellow]Action cancelled.[/yellow]")
+        return True
+
+    if selected_item["type"] == "group":
+        action_choice = (
+            console.input(
+                "[bold]Available actions:[/bold]\n"
+                "  [cyan]r[/cyan] - Rename group\n"
+                "  [red]d[/red] - Delete group\n"
+                "  [yellow]c[/yellow] - Cancel\n\n"
+                "Choose action (r/d/c): "
+            )
+            .strip()
+            .lower()
+        )
+
+        if action_choice == "r":
+            return rename_single_group(guac_api, selected_item)
+        if action_choice == "d":
+            return delete_single_item(guac_api, selected_item)
+        console.print("[yellow]Action cancelled.[/yellow]")
+        return True
+
+    return True
+
+
+def edit_single_connection(guac_api: Any, item: Dict[str, Any]) -> bool:
+    """Edit parameters of a single connection with PVE integration"""
+    console.print(f"\n[bold cyan]Editing Connection: {item['name']}[/bold cyan]")
+
+    conn_data = item["connection_data"]
+    params = conn_data.get("parameters", {})
+
+    # Check if this is a PVE-sourced connection
+    config = Config()
+    proxmox_api = ProxmoxAPI(config)
+    pve_data: Optional[Dict[str, Any]] = None
+    is_pve_connection = False
+
+    # Try to find matching VM data from PVE
+    try:
+        if proxmox_api.test_auth():
+            nodes = proxmox_api.get_nodes()
+            for node in nodes:
+                vms = proxmox_api.get_vms(node["node"])
+                for vm in vms:
+                    vm_name = vm.get("name", f"VM-{vm['vmid']}")
+                    # Check if connection name matches VM or contains VM ID
+                    if (
+                        vm_name in item["name"]
+                        or str(vm["vmid"]) in item["name"]
+                        or item["name"].startswith(vm_name)
+                    ):
+
+                        # Get VM notes and try to parse credentials
+                        try:
+                            vm_config = proxmox_api.get_vm_config(
+                                node["node"], vm["vmid"]
+                            )
+                            notes = vm_config.get("description", "")
+                            if notes:
+                                parsed_creds = proxmox_api.parse_credentials_from_notes(
+                                    notes, vm_name, str(vm["vmid"]), node["node"]
+                                )
+                                if parsed_creds:
+                                    pve_data = {
+                                        "node": node["node"],
+                                        "vmid": vm["vmid"],
+                                        "vm_name": vm_name,
+                                        "credentials": parsed_creds,
+                                        "vm_config": vm_config,
+                                    }
+                                    is_pve_connection = True
+                                    break
+                        except:
+                            pass
+                if pve_data:
+                    break
+    except:
+        pass
+
+    if is_pve_connection and pve_data:
+        console.print(
+            f"[green]✓ Found matching PVE VM: {pve_data['vm_name']} (ID: {pve_data['vmid']}) on node {pve_data['node']}[/green]"
+        )
+        console.print(
+            "[dim]Will show both Guacamole and PVE data where available[/dim]"
+        )
+    else:
+        console.print("[yellow]⚠ External connection (not linked to PVE VM)[/yellow]")
+        console.print("[dim]Showing Guacamole data only[/dim]")
+
+    console.print(
+        "\n[dim]Current settings (press ENTER to keep current value, TAB for completion):[/dim]"
+    )
+
+    # Edit basic parameters with enhanced input and PVE integration
+    current_name = item["name"]
+    new_name = enhanced_input(f"Name [{current_name}]: ", current_name)
+
+    # Hostname with PVE data if available
+    current_hostname = params.get("hostname", "")
+    pve_hostname = None
+    if is_pve_connection and pve_data:
+        # Try to get VM IP from PVE
+        try:
+            vm_network = proxmox_api.get_vm_network_info(
+                pve_data["node"], pve_data["vmid"]
+            )
+            for interface in vm_network:
+                if interface.get("inet"):
+                    pve_hostname = interface["inet"].split("/")[0]
+                    break
+        except:
+            pass
+
+    # Show both options if they differ
+    hostname_prompt = f"Hostname [{current_hostname}]"
+    if pve_hostname and pve_hostname != current_hostname:
+        console.print(f"[dim]Guacamole: {current_hostname}[/dim]")
+        console.print(f"[dim]PVE detected: {pve_hostname}[/dim]")
+        hostname_prompt = f"Hostname [Guac:{current_hostname} | PVE:{pve_hostname}]"
+
+    # Get existing hostnames for completion
+    existing_hostnames = []
+    try:
+        connections = guac_api.get_connections()
+        existing_hostnames = list(
+            {
+                conn.get("parameters", {}).get("hostname", "")
+                for conn in connections.values()
+                if conn.get("parameters", {}).get("hostname")
+            }
+        )
+        if pve_hostname:
+            existing_hostnames.append(pve_hostname)
+    except:
+        pass
+    new_hostname = enhanced_input(
+        f"{hostname_prompt}: ", current_hostname, existing_hostnames
+    )
+
+    # Port with PVE data if available
+    current_port = params.get("port", "3389" if item["protocol"] == "rdp" else "22")
+    pve_port = None
+    if is_pve_connection and pve_data and pve_data["credentials"]:
+        # Check if PVE credentials have port info
+        for cred in pve_data["credentials"]:
+            if item["protocol"] in cred.get("protocols", []):
+                pve_port = cred.get(f'{item["protocol"]}_port', cred.get("port"))
+                break
+
+    port_prompt = f"Port [{current_port}]"
+    if pve_port and str(pve_port) != str(current_port):
+        console.print(f"[dim]Guacamole: {current_port}[/dim]")
+        console.print(f"[dim]PVE notes: {pve_port}[/dim]")
+        port_prompt = f"Port [Guac:{current_port} | PVE:{pve_port}]"
+
+    # Common port suggestions based on protocol
+    port_suggestions = {
+        "rdp": ["3389", "3390", "3391"],
+        "ssh": ["22", "2222", "2200"],
+        "vnc": ["5900", "5901", "5902"],
+    }.get(item["protocol"], ["22", "3389", "5900"])
+    if pve_port:
+        port_suggestions.insert(0, str(pve_port))
+    new_port = enhanced_input(f"{port_prompt}: ", current_port, port_suggestions)
+
+    # Username with PVE data if available
+    current_username = params.get("username", "")
+    pve_username = None
+    if is_pve_connection and pve_data and pve_data["credentials"]:
+        # Check if PVE credentials have username info
+        for cred in pve_data["credentials"]:
+            if item["protocol"] in cred.get("protocols", []):
+                pve_username = cred.get("username")
+                break
+
+    username_prompt = f"Username [{current_username}]"
+    if pve_username and pve_username != current_username:
+        console.print(f"[dim]Guacamole: {current_username}[/dim]")
+        console.print(f"[dim]PVE notes: {pve_username}[/dim]")
+        username_prompt = f"Username [Guac:{current_username} | PVE:{pve_username}]"
+
+    # Common username suggestions
+    username_suggestions = ["admin", "administrator", "root", "user"]
+    if current_username:
+        username_suggestions.insert(0, current_username)
+    if pve_username and pve_username not in username_suggestions:
+        username_suggestions.insert(0, pve_username)
+    new_username = enhanced_input(
+        f"{username_prompt}: ", current_username, username_suggestions
+    )
+
+    current_password = params.get("password", "")
+    if current_password:
+        password_display = "*" * min(8, len(current_password))
+        new_password_input = console.input(
+            f"Password [{password_display}] (leave blank to keep current): "
+        ).strip()
+        new_password = new_password_input if new_password_input else current_password
+    else:
+        new_password = console.input("Password (optional): ").strip()
+
+    # Protocol selection
+    current_protocol = item["protocol"]
+    protocol_options = ["rdp", "vnc", "ssh"]
+    new_protocol = enhanced_input(
+        f"Protocol [{current_protocol}]: ", current_protocol, protocol_options
+    ).lower()
+
+    # Validate protocol
+    if new_protocol and new_protocol not in protocol_options:
+        console.print(f"[yellow]⚠ Invalid protocol '{new_protocol}', keeping current ({current_protocol})[/yellow]")
+        new_protocol = current_protocol
+
+    # Show confirmation
+    console.print("\n[bold]Review changes:[/bold]")
+    console.print(f"Name: {current_name} -> [cyan]{new_name}[/cyan]")
+    console.print(f"Hostname: {current_hostname} -> [cyan]{new_hostname}[/cyan]")
+    console.print(f"Port: {current_port} -> [cyan]{new_port}[/cyan]")
+    console.print(f"Username: {current_username} -> [cyan]{new_username}[/cyan]")
+    console.print(
+        f"Password: {'Updated' if new_password != current_password else 'Unchanged'}"
+    )
+    console.print(f"Protocol: {current_protocol} -> [cyan]{new_protocol}[/cyan]")
+
+    confirm = Confirm.ask("\n[cyan]Save changes?[/cyan]", default=False)
+
+    if confirm:
+        try:
+            port_int = int(new_port)
+            success = guac_api.update_connection(
+                identifier=item["id"],
+                name=new_name,
+                hostname=new_hostname,
+                username=new_username,
+                password=new_password,
+                port=port_int,
+                protocol=new_protocol,
+            )
+
+            if success:
+                console.print(
+                    f"[green]✓ Successfully updated connection: {new_name}[/green]"
+                )
+            else:
+                console.print(f"[red]✗ Failed to update connection: {new_name}[/red]")
+
+        except ValueError:
+            console.print(f"[red]✗ Invalid port number: {new_port}[/red]")
+
+    else:
+        console.print("[yellow]Changes discarded.[/yellow]")
+
+    input("\nPress Enter to continue...")
+    return True
+
+
+def rename_single_group(guac_api: Any, item: Dict[str, Any]) -> bool:
+    """Rename a connection group"""
+    console.print(f"\n[bold cyan]Renaming Group: {item['name']}[/bold cyan]")
+
+    current_name = item["name"]
+    new_name = console.input(f"New name [{current_name}]: ").strip() or current_name
+
+    if new_name == current_name:
+        console.print("[yellow]No changes made.[/yellow]")
+        input("\nPress Enter to continue...")
+        return True
+
+    confirm = Confirm.ask(
+        f"\n[cyan]Rename group '{current_name}' to '[bold]{new_name}[/bold]'?[/cyan]",
+        default=False
+    )
+
+    if confirm:
+        try:
+            success = guac_api.update_connection_group(item["id"], new_name)
+            if success:
+                console.print(
+                    f"[green]✓ Successfully renamed group to '{new_name}'[/green]"
+                )
+            else:
+                console.print(f"[red]✗ Failed to rename group to '{new_name}'[/red]")
+        except Exception as e:
+            console.print(f"[red]✗ Error renaming group: {e}[/red]")
+    else:
+        console.print("[yellow]Rename cancelled.[/yellow]")
+
+    input("\nPress Enter to continue...")
+    return True
+
+
+def delete_single_item(guac_api: Any, item: Dict[str, Any]) -> bool:
+    """Delete a single connection or group"""
+    console.print("\n[red bold]⚠ CONFIRM DELETION ⚠[/red bold]")
+    console.print(f"\nThe following {item['type']} will be permanently deleted:")
+    console.print(f"  • {item['display']}")
+
+    confirm = Prompt.ask("\n[red]Type 'DELETE' to confirm deletion[/red]").strip()
+
+    if confirm != "DELETE":
+        console.print(
+            "\n[yellow]Deletion cancelled - confirmation text did not match.[/yellow]"
+        )
+        input("Press Enter to continue...")
+        return True
+
+    # Perform deletion
+    console.print(f"\n[red]Deleting {item['type']}...[/red]")
+
+    try:
+        if item["type"] == "connection":
+            success = guac_api.delete_connection(item["id"])
+            if success:
+                console.print(f"[green]✓ Deleted connection: {item['name']}[/green]")
+            else:
+                console.print(
+                    f"[red]✗ Failed to delete connection: {item['name']}[/red]"
+                )
+        elif item["type"] == "group":
+            success = guac_api.delete_connection_group(item["id"])
+            if success:
+                console.print(f"[green]✓ Deleted group: {item['name']}[/green]")
+            else:
+                console.print(f"[red]✗ Failed to delete group: {item['name']}[/red]")
+    except Exception as e:
+        console.print(f"[red]✗ Error deleting {item['name']}: {e}[/red]")
+
+    input("\nPress Enter to continue...")
+    return True
+
+
+def process_single_vm_auto(
+    config: Any, proxmox_api: Any, guac_api: Any, node_name: str, vm: Dict[str, Any], credentials: List[Dict[str, Any]], force: bool = False
+) -> bool:
+    """Process a single VM with automatic configuration"""
+    vm_id = vm["vmid"]
+    vm_name = vm.get("name", f"VM-{vm_id}")
+
+    try:
+        # Check VM status and start if needed
+        vm_status = proxmox_api.get_vm_status(node_name, vm_id)
+        original_status = vm_status.get("status", "unknown")
+        vm_was_started = False
+
+        if original_status in ("stopped", "shutdown"):
+            console.print(
+                f"   [blue] VM is {original_status}. Starting VM for network detection...[/blue]"
+            )
+            if proxmox_api.start_vm(node_name, vm_id):
+                vm_was_started = True
+                console.print(
+                    "   [yellow] Waiting 30 seconds for VM to boot...[/yellow]"
+                )
+
+                time.sleep(30)
+            else:
+                console.print(f"   [red]  Failed to start VM {vm_id}[/red]")
+
+        # Get network info to find IP
+        network_details = proxmox_api.get_vm_network_info(node_name, vm_id)
+
+        # Try to find VM IP and collect MACs for WoL
+        vm_ip = None
+        vm_macs: List[str] = []
+
+        for interface in network_details:
+            # Collect MAC addresses for WoL
+            mac = (
+                interface.get("mac")
+                or interface.get("virtio")
+                or interface.get("e1000")
+                or interface.get("rtl8139")
+            )
+            if mac:
+                vm_macs.append(mac)
+
+            # Find IP address - IPv4 ONLY (no IPv6)
+            for addr in interface.get("ip_addresses", []):
+                ip_addr = addr.get("ip-address") or addr.get("address")
+                if (
+                    ip_addr
+                    and not ip_addr.startswith("127.")
+                    and not ip_addr.startswith("::1")
+                ):
+                    # Reject IPv6 addresses completely - only accept IPv4
+                    if "::" in ip_addr or (":" in ip_addr and "." not in ip_addr):
+                        continue  # Skip IPv6 addresses
+                    vm_ip = ip_addr
+                    break
+
+            if vm_ip:
+                break
+
+        if not vm_ip:
+            # Try network scanning with MAC addresses
+            for mac in vm_macs:
+                scan_result = NetworkScanner.find_mac_on_network(mac)
+                if scan_result:
+                    vm_ip = scan_result["ip"]
+                    console.print(
+                        f"   [green] Found VM at IP {vm_ip} via network scan[/green]"
+                    )
+                    break
+
+        if not vm_ip:
+            console.print(
+                f"   [red] Cannot determine IP address for VM {vm_name}[/red]"
+            )
+            # Restore VM state before returning
+            if vm_was_started and original_status in ("stopped", "shutdown"):
+                console.print(
+                    f"   [blue] Restoring VM to {original_status} state...[/blue]"
+                )
+                proxmox_api.stop_vm(node_name, vm_id)
+            return False
+
+        # Create connection group for the VM only if there are multiple connections
+        parent_identifier = None
+        if len(credentials) > 1:
+            group_name = vm_name
+            console.print(f"   [cyan] Creating connection group: {group_name}[/cyan]")
+            parent_identifier = guac_api.create_connection_group(group_name)
+            if parent_identifier is None:
+                console.print(
+                    "   [yellow]  Failed to create connection group. Connections will be created at root level.[/yellow]"
+                )
+
+        # Use the first available MAC for WoL
+        primary_mac = vm_macs[0] if vm_macs else None
+
+        # Create connections for each credential set (duplicates already handled by caller)
+        created_count = 0
+        for cred in credentials:
+            connection_name = cred["connection_name"]
+            protocol = cred["protocol"]
+            username = cred["username"]
+            password = cred["password"]
+            port = cred.get(
+                "port",
+                3389 if protocol == "rdp" else (22 if protocol == "ssh" else 5900),
+            )
+
+            # Get WoL and RDP settings from credentials
+            wol_disabled = cred.get("wol_disabled", False)
+            rdp_settings = cred.get("rdp_settings", {})
+            wol_settings = cred.get("wol_settings", {})
+
+            # Create connection based on protocol (with parent group)
+            identifier = None
+            if protocol == "rdp":
+                identifier = guac_api.create_rdp_connection(
+                    name=connection_name,
+                    hostname=vm_ip,
+                    username=username,
+                    password=password,
+                    port=port,
+                    parent_identifier=parent_identifier,
+                    enable_wol=(not wol_disabled and primary_mac is not None),
+                    mac_address=primary_mac or "",
+                    rdp_settings=rdp_settings if rdp_settings else None,
+                    wol_settings=wol_settings if wol_settings else None,
+                )
+            elif protocol == "vnc":
+                # Get VNC-specific settings from credentials
+                vnc_settings = cred.get("vnc_settings", {})
+                identifier = guac_api.create_vnc_connection(
+                    name=connection_name,
+                    hostname=vm_ip,
+                    password=password,
+                    port=port,
+                    parent_identifier=parent_identifier,
+                    enable_wol=(not wol_disabled and primary_mac is not None),
+                    mac_address=primary_mac or "",
+                    wol_settings=wol_settings if wol_settings else None,
+                    vnc_settings=vnc_settings if vnc_settings else None,
+                )
+            elif protocol == "ssh":
+                identifier = guac_api.create_ssh_connection(
+                    name=connection_name,
+                    hostname=vm_ip,
+                    username=username,
+                    password=password,
+                    port=port,
+                    parent_identifier=parent_identifier,
+                    enable_wol=(not wol_disabled and primary_mac is not None),
+                    mac_address=primary_mac or "",
+                    wol_settings=wol_settings if wol_settings else None,
+                )
+
+            if identifier:
+                created_count += 1
+                console.print(
+                    f"   [green] Created {protocol.upper()} connection:[/green] [cyan]{connection_name}[/cyan]"
+                )
+            else:
+                console.print(
+                    f"   [red] Failed to create {protocol.upper()} connection:[/red] [yellow]{connection_name}[/yellow]"
+                )
+
+        # Restore VM state if we started it
+        if vm_was_started and original_status in ("stopped", "shutdown"):
+            console.print(
+                f"   [blue] Restoring VM to original state ([cyan]{original_status}[/cyan])...[/blue]"
+            )
+            if proxmox_api.stop_vm(node_name, vm_id):
+                console.print(
+                    f"   [green] VM restored to {original_status} state[/green]"
+                )
+            else:
+                console.print(
+                    f"   [yellow]  Failed to restore VM to {original_status} state[/yellow]"
+                )
+
+        return created_count > 0
+
+    except Exception as e:
+        console.print(f"   [red]✗ Exception during VM processing: {e}[/red]")
+        import traceback
+        if os.environ.get("GUAC_DEBUG"):
+            console.print(f"   [dim]{traceback.format_exc()}[/dim]")
+        return False
+
+
+def auto_process_all_vms(
+    force: bool = False,
+    filter_node: Optional[str] = None,
+    filter_vm: Optional[str] = None,
+    skip_existing: bool = True,
+    start_vms: Optional[bool] = None,
+    restore_power: Optional[bool] = None,
+    dry_run: bool = False,
+) -> None:
+    """Auto-process all VMs with credentials in notes with enhanced output."""
+
+    # Enhanced header with better styling
+    title_text = Text("● AUTO VM PROCESSOR", style="bold cyan")
+    console.print(
+        Panel(
+            title_text,
+            title="[bold]Auto Processor[/bold]",
+            border_style="blue",
+            padding=(0, 2),
+        )
+    )
+
+    if force:
+        console.print(
+            Panel(
+                "[bold yellow]FORCE MODE:[/bold yellow] Recreating all existing connections",
+                border_style="yellow",
+            )
+        )
+
+    # Initialize services with Rich progress
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Initializing services...", total=None)
+
+        try:
+            config = Config()
+            proxmox_api = ProxmoxAPI(config)
+            guac_api = GuacamoleAPI(config)
+
+            # Test connections
+            nodes = proxmox_api.get_nodes()
+            guac_api.authenticate()
+            guac_api.get_connections()
+
+            progress.update(task, description="Services initialized successfully!")
+            progress.stop()
+            console.print("[green]✓[/green] Services initialized successfully!")
+
+        except Exception as e:
+            progress.stop()
+            console.print(f"[red]✗ Failed to initialize services: {e}[/red]")
+            return
+
+    # Find VMs with credentials using Rich progress
+    vms_with_creds: List[Dict[str, Any]] = []
+
+    console.print("\n[bold]● Scanning for VMs with credentials[/bold]")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        scanning_task = progress.add_task("Scanning nodes...", total=len(nodes))
+
+        for i, node in enumerate(nodes):
+            node_name = node["node"]
+            progress.update(scanning_task, description=f"Scanning node: {node_name}")
+
+            # Get VMs for this node
+            vms = proxmox_api.get_vms(node_name)
+
+            for vm in vms:
+                vm_id = vm["vmid"]
+
+                # Get VM config to check notes
+                try:
+                    vm_config = proxmox_api.get_vm_config(node_name, vm_id)
+                    notes = vm_config.get("description", "")
+
+                    # Parse credentials from notes with smart password recovery
+                    parsed_creds: List[Dict[str, Any]] = []
+                    while True:
+                        try:
+                            parsed_creds = proxmox_api.parse_credentials_from_notes(
+                                notes,
+                                vm.get("name", ""),
+                                str(vm_id),
+                                node_name,
+                                "unknown",
+                                prompt_on_decrypt_failure=False,
+                            )
+                            break
+                        except CredentialRecoveryPending as pending:
+                            # Update progress message to reflect the pause
+                            friendly_vm = pending.vm_name or f"VMID {pending.vm_id}"
+                            progress.update(
+                                scanning_task,
+                                description=f"Awaiting password for {friendly_vm}",
+                            )
+                            recovered_password = proxmox_api.prompt_password_reentry(
+                                pending.decrypt_error,
+                                username=pending.username,
+                                vm_name=pending.vm_name,
+                                vm_id=pending.vm_id,
+                                vm_node=pending.vm_node,
+                            )
+                            if recovered_password:
+                                proxmox_api.cache_password_override(
+                                    pending.vm_node,
+                                    pending.vm_id,
+                                    pending.username,
+                                    recovered_password,
+                                )
+                                console.print(
+                                    "[green]Password accepted. Resuming credential scan...[/green]"
+                                )
+                                # Loop will retry parsing with override in place
+                                continue
+                            else:
+                                console.print(
+                                    "[yellow]Skipping credentials for this VM during auto-sync (password unresolved).[/yellow]"
+                                )
+                                parsed_creds = []
+                                break
+
+                    if parsed_creds:
+                        vms_with_creds.append(
+                            {"node": node_name, "vm": vm, "credentials": parsed_creds}
+                        )
+                except:
+                    continue
+
+            progress.advance(scanning_task)
+
+        progress.update(
+            scanning_task,
+            description=f"Found {len(vms_with_creds)} VMs with credentials!",
+        )
+
+    console.print(
+        f"[green]✓[/green] Found [bold]{len(vms_with_creds)}[/bold] VMs with credentials!"
+    )
+
+    if not vms_with_creds:
+        console.print(
+            Panel(
+                "[yellow]No VMs found with credentials in notes[/yellow]\n\n"
+                "Add credentials to VM notes in the format:\n"
+                '[cyan]user:"admin" pass:"password" protos:"rdp,ssh"[/cyan]',
+                title="[yellow]No Credentials Found[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return
+
+    # Process each VM with enhanced Rich progress
+    console.print(f"\n[bold]● Processing [cyan]{len(vms_with_creds)}[/cyan] VMs[/bold]")
+
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        "•",
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+    ) as progress:
+        main_task = progress.add_task("Processing VMs...", total=len(vms_with_creds))
+
+        for i, vm_data in enumerate(vms_with_creds):
+            vm = vm_data["vm"]
+            node_name = vm_data["node"]
+            creds = vm_data["credentials"]
+
+            vm_name = vm.get("name", f"VM-{vm['vmid']}")
+            progress.update(main_task, description=f"Processing: {vm_name}")
+
+            console.print(
+                f"\n[bold cyan]● {vm_name}[/bold cyan] [dim]({i+1}/{len(vms_with_creds)})[/dim]"
+            )
+
+            # Check if ALL connections for this VM already exist (proper duplicate checking)
+            all_exist = True
+            existing_connections: List[Tuple[str, Dict[str, Any]]] = []
+
+            for cred in creds:
+                connection_name = cred["connection_name"]
+                existing = guac_api.get_connection_by_name(connection_name)
+                if existing:
+                    existing_connections.append((connection_name, existing))
+                else:
+                    all_exist = False
+
+            if all_exist and not force:
+                console.print(
+                    "  [yellow]⏭ All connections already exist (use --force to recreate)[/yellow]"
+                )
+                skip_count += len(creds)
+                progress.advance(main_task)
+                continue
+
+            if existing_connections and force:
+                console.print(
+                    f"  [yellow]● Removing {len(existing_connections)} existing connection(s)[/yellow]"
+                )
+                for conn_name, existing in existing_connections:
+                    try:
+                        success = guac_api.delete_connection(existing["identifier"])
+                        if success:
+                            console.print(f"    [green]✓[/green] Deleted: {conn_name}")
+                        else:
+                            console.print(
+                                f"    [red]✗[/red] Could not delete: {conn_name}"
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"    [red]✗[/red] Failed to delete {conn_name}: {e}"
+                        )
+
+            # Process VM
+            try:
+                # Start sync animation
+                anim = SyncAnimation(f"Syncing {vm_name}")
+                anim.start()
+                
+                try:
+                    anim.update(f"Processing {len(creds)} connection(s) for {vm_name}")
+                    
+                    # Actually process the VM - simplified auto processing
+                    result = process_single_vm_auto(
+                        config, proxmox_api, guac_api, node_name, vm, creds, force
+                    )
+
+                    if result:
+                        anim.stop(f"Successfully synced {vm_name}")
+                        success_count += 1
+                    else:
+                        anim.stop()
+                        safe_print("  ✗ Failed to add", "red")
+                        error_count += 1
+                        
+                except Exception as e:
+                    anim.stop()
+                    safe_print(f"  ✗ Error: {str(e)[:50]}...", "red")
+                    error_count += 1
+
+            except Exception as e:
+                safe_print(f"  ✗ Error: {str(e)[:50]}...", "red")
+                error_count += 1
+
+            progress.advance(main_task)
+
+    # Enhanced summary
+    console.print("\n" + "=" * 60)
+    console.print(
+        Panel.fit(
+            "[bold green]● PROCESSING COMPLETE![/bold green]",
+            border_style="green",
+            padding=(0, 2),
+        )
+    )
+
+    # Create summary table
+    summary_table = Table(show_header=False, padding=(0, 2))
+    summary_table.add_column("Metric", style="cyan", min_width=20)
+    summary_table.add_column("Count", style="white", justify="right")
+    summary_table.add_column("Status", style="white")
+
+    summary_table.add_row(
+        "Successfully processed",
+        str(success_count),
+        "[green]✓[/green]" if success_count > 0 else "",
+    )
+    summary_table.add_row(
+        "Skipped (existing)",
+        str(skip_count),
+        "[yellow]⏭[/yellow]" if skip_count > 0 else "",
+    )
+    summary_table.add_row(
+        "Errors", str(error_count), "[red]✗[/red]" if error_count > 0 else ""
+    )
+    summary_table.add_row("Total VMs processed", str(len(vms_with_creds)), "")
+
+    console.print(summary_table)
+
+    if success_count > 0:
+        console.print(
+            f"\n[bold green]{success_count} new connections ready in Guacamole![/bold green]"
+        )
+
+    console.print("=" * 60)
+
+
+def edit_connection_direct(
+    connection_name: str,
+    new_hostname: Optional[str] = None,
+    new_username: Optional[str] = None,
+    new_password: Optional[str] = None,
+    new_port: Optional[int] = None,
+    new_protocol: Optional[str] = None,
+    enable_wol: Optional[bool] = None,
+    new_mac: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Direct edit function for non-interactive connection editing"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    # Validate protocol if provided
+    if new_protocol is not None:
+        new_protocol = new_protocol.lower()
+        if new_protocol not in ["rdp", "vnc", "ssh"]:
+            console.print(f"[red]Invalid protocol: {new_protocol}. Must be rdp, vnc, or ssh[/red]")
+            return False
+
+    # Find the connection
+    connections = guac_api.get_connections()
+    target_conn = None
+    target_id = None
+
+    for conn_id, conn in connections.items():
+        if conn.get("name") == connection_name:
+            target_conn = conn
+            target_id = conn_id
+            break
+
+    if not target_conn or not target_id:
+        console.print(f"[red]Connection '{connection_name}' not found[/red]")
+        return False
+
+    # Get current parameters
+    params = target_conn.get("parameters", {})
+    current_hostname = params.get("hostname", "")
+    current_username = params.get("username", "")
+    current_port = params.get("port", "")
+    current_protocol = target_conn.get("protocol", "rdp")
+    current_wol = params.get("wol-send-packet") == "true"
+    current_mac = params.get("wol-mac-addr", "")
+
+    # Apply updates
+    updated_hostname = new_hostname if new_hostname is not None else current_hostname
+    updated_username = new_username if new_username is not None else current_username
+    updated_password = (
+        new_password if new_password is not None else params.get("password", "")
+    )
+    updated_port = (
+        new_port
+        if new_port is not None
+        else int(current_port) if current_port else 3389
+    )
+    updated_protocol = new_protocol if new_protocol is not None else current_protocol
+    updated_wol = enable_wol if enable_wol is not None else current_wol
+    updated_mac = new_mac if new_mac is not None else current_mac
+
+    # Show changes if not forced
+    if not force:
+        console.print(f"\n[bold]Updating connection: {connection_name}[/bold]")
+        console.print(f"Hostname: {current_hostname} -> {updated_hostname}")
+        console.print(f"Username: {current_username} -> {updated_username}")
+        console.print(f"Port: {current_port} -> {updated_port}")
+        console.print(f"Protocol: {current_protocol} -> {updated_protocol}")
+        console.print(f"WoL: {current_wol} -> {updated_wol}")
+        console.print(f"MAC: {current_mac} -> {updated_mac}")
+
+        confirm = Confirm.ask("\n[cyan]Proceed with update?[/cyan]", default=False)
+        if not confirm:
+            console.print("[yellow]Update cancelled[/yellow]")
+            return False
+
+    # Update the connection
+    success = guac_api.update_connection(
+        identifier=target_id,
+        name=connection_name,
+        hostname=updated_hostname,
+        username=updated_username,
+        password=updated_password,
+        port=updated_port,
+        protocol=updated_protocol,
+        enable_wol=updated_wol,
+        mac_address=updated_mac,
+    )
+
+    if success:
+        console.print(
+            f"[green]✓ Successfully updated connection: {connection_name}[/green]"
+        )
+        return True
+    console.print(f"[red]✗ Failed to update connection: {connection_name}[/red]")
+    return False
+
+
+def delete_connections_direct(
+    connection_name: Optional[str] = None,
+    group_name: Optional[str] = None,
+    force: bool = False,
+    delete_all: bool = False,
+) -> bool:
+    """Direct delete function for non-interactive connection/group deletion"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    items_to_delete: List[Dict[str, Any]] = []
+
+    if delete_all:
+        # Delete all connections and groups
+        connections = guac_api.get_connections()
+        groups = guac_api.get_connection_groups()
+
+        for conn_id, conn in connections.items():
+            items_to_delete.append(
+                {"type": "connection", "id": conn_id, "name": conn.get("name", "N/A")}
+            )
+
+        for group_id, group in groups.items():
+            items_to_delete.append(
+                {"type": "group", "id": group_id, "name": group.get("name", "N/A")}
+            )
+    elif connection_name:
+        # Find specific connection
+        connections = guac_api.get_connections()
+        for conn_id, conn in connections.items():
+            if conn.get("name") == connection_name:
+                items_to_delete.append(
+                    {"type": "connection", "id": conn_id, "name": connection_name}
+                )
+                break
+    elif group_name:
+        # Find specific group
+        groups = guac_api.get_connection_groups()
+        for group_id, group in groups.items():
+            if group.get("name") == group_name:
+                items_to_delete.append(
+                    {"type": "group", "id": group_id, "name": group_name}
+                )
+                break
+
+    if not items_to_delete:
+        console.print("[yellow]No items found to delete[/yellow]")
+        return False
+
+    # Show what will be deleted
+    if not force:
+        console.print(
+            f"\n[red]⚠ CONFIRMING DELETION OF {len(items_to_delete)} ITEM(S)[/red]"
+        )
+        for item in items_to_delete:
+            console.print(f"  • {item['type'].title()}: {item['name']}")
+
+        confirm = Prompt.ask("\n[red]Type 'DELETE' to confirm[/red]").strip()
+        if confirm != "DELETE":
+            console.print("[yellow]Deletion cancelled[/yellow]")
+            return False
+
+    # Perform deletions
+    success_count = 0
+    for item in items_to_delete:
+        try:
+            if item["type"] == "connection":
+                if guac_api.delete_connection(item["id"]):
+                    console.print(
+                        f"[green]✓ Deleted connection: {item['name']}[/green]"
+                    )
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete connection: {item['name']}[/red]"
+                    )
+            elif item["type"] == "group":
+                if guac_api.delete_connection_group(item["id"]):
+                    console.print(f"[green]✓ Deleted group: {item['name']}[/green]")
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete group: {item['name']}[/red]"
+                    )
+        except Exception as e:
+            console.print(f"[red]✗ Error deleting {item['name']}: {e}[/red]")
+
+    console.print(
+        f"\n[green]Successfully deleted: {success_count}/{len(items_to_delete)} items[/green]"
+    )
+    return success_count > 0
+
+
+def edit_connections_by_pattern(
+    connection_pattern: str,
+    new_hostname: Optional[str] = None,
+    new_username: Optional[str] = None,
+    new_password: Optional[str] = None,
+    new_port: Optional[int] = None,
+    new_protocol: Optional[str] = None,
+    enable_wol: Optional[bool] = None,
+    new_mac: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Edit connections matching a pattern with regex support"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    # Validate protocol if provided
+    if new_protocol is not None:
+        new_protocol = new_protocol.lower()
+        if new_protocol not in ["rdp", "vnc", "ssh"]:
+            console.print(f"[red]Invalid protocol: {new_protocol}. Must be rdp, vnc, or ssh[/red]")
+            return False
+
+    # Get all connections
+    connections = guac_api.get_connections()
+    if not connections:
+        console.print("[yellow]No connections found[/yellow]")
+        return False
+
+    # Parse patterns (comma-separated)
+    patterns = [p.strip() for p in connection_pattern.split(",") if p.strip()]
+
+    # Find matching connections
+    matching_connections: List[Tuple[str, Dict[str, Any]]] = []
+    for conn_id, conn in connections.items():
+        name = conn.get("name", "")
+        for pattern in patterns:
+
+            try:
+                if re.search(pattern, name, re.IGNORECASE):
+                    matching_connections.append((conn_id, conn))
+                    break
+            except re.error:
+                # If regex is invalid, treat as literal string
+                if pattern.lower() in name.lower():
+                    matching_connections.append((conn_id, conn))
+                    break
+
+    if not matching_connections:
+        console.print(
+            f"[yellow]No connections match pattern: {connection_pattern}[/yellow]"
+        )
+        return False
+
+    console.print(
+        f"[cyan]Found {len(matching_connections)} connection(s) matching pattern: {connection_pattern}[/cyan]"
+    )
+
+    # Show what will be updated
+    if not force:
+        console.print("\n[bold]Connections to update:[/bold]")
+        for conn_id, conn in matching_connections:
+            console.print(f"  • {cast(str, conn.get('name', 'N/A'))}")
+
+        console.print("\n[bold]Changes to apply:[/bold]")
+        if new_hostname is not None:
+            console.print(f"  Hostname: -> {new_hostname}")
+        if new_username is not None:
+            console.print(f"  Username: -> {new_username}")
+        if new_password is not None:
+            console.print("  Password: -> [updated]")
+        if new_port is not None:
+            console.print(f"  Port: -> {new_port}")
+        if new_protocol is not None:
+            console.print(f"  Protocol: -> {new_protocol}")
+        if enable_wol is not None:
+            console.print(f"  WoL: -> {'enabled' if enable_wol else 'disabled'}")
+        if new_mac is not None:
+            console.print(f"  MAC: -> {new_mac}")
+
+        confirm = Confirm.ask(
+            f"\n[cyan]Update {len(matching_connections)} connection(s)?[/cyan]",
+            default=False
+        )
+        if not confirm:
+            console.print("[yellow]Update cancelled[/yellow]")
+            return False
+
+    # Update connections
+    success_count = 0
+    for conn_id, conn in matching_connections:
+        try:
+            # Get current values
+            params = cast(Dict[str, Any], conn.get("parameters", {}))
+            current_hostname = cast(str, params.get("hostname", ""))
+            current_username = cast(str, params.get("username", ""))
+            current_password = cast(str, params.get("password", ""))
+            current_protocol = cast(str, conn.get("protocol", "rdp"))
+            current_port = int(cast(Union[str, int], params.get("port", 3389)))
+            current_wol = params.get("wol-send-packet") == "true"
+            current_mac = cast(str, params.get("wol-mac-addr", ""))
+
+            success = guac_api.update_connection(
+                identifier=conn_id,
+                name=cast(str, conn.get("name", "")),
+                hostname=new_hostname if new_hostname is not None else current_hostname,
+                username=new_username if new_username is not None else current_username,
+                password=new_password if new_password is not None else current_password,
+                port=new_port if new_port is not None else current_port,
+                protocol=new_protocol if new_protocol is not None else current_protocol,
+                enable_wol=enable_wol if enable_wol is not None else current_wol,
+                mac_address=new_mac if new_mac is not None else current_mac,
+            )
+
+            if success:
+                console.print(f"[green]✓ Updated: {cast(str, conn.get('name', ''))}[/green]")
+                success_count += 1
+            else:
+                console.print(f"[red]✗ Failed to update: {cast(str, conn.get('name', ''))}[/red]")
+        except Exception as e:
+            console.print(f"[red]✗ Error updating {cast(str, conn.get('name', ''))}: {e}[/red]")
+
+    console.print(
+        f"\n[green]Successfully updated: {success_count}/{len(matching_connections)} connections[/green]"
+    )
+    return success_count > 0
+
+
+def delete_connections_by_pattern(
+    connection_pattern: Optional[str] = None,
+    group_pattern: Optional[str] = None,
+    force: bool = False,
+    delete_all: bool = False,
+) -> bool:
+    """Delete connections and groups matching patterns with regex support"""
+    config = Config()
+    guac_api = GuacamoleAPI(config)
+
+    if not guac_api.authenticate():
+        console.print(
+            Panel(" Failed to authenticate with Guacamole", border_style="red")
+        )
+        return False
+
+    items_to_delete: List[Dict[str, Any]] = []
+
+    if delete_all:
+        # Delete all connections and groups
+        connections = guac_api.get_connections()
+        groups = guac_api.get_connection_groups()
+
+        for conn_id, conn in connections.items():
+            items_to_delete.append(
+                {"type": "connection", "id": conn_id, "name": conn.get("name", "N/A")}
+            )
+
+        for group_id, group in groups.items():
+            items_to_delete.append(
+                {"type": "group", "id": group_id, "name": group.get("name", "N/A")}
+            )
+    else:
+        # Find matching connections
+        if connection_pattern:
+            connections = guac_api.get_connections()
+            patterns = [p.strip() for p in connection_pattern.split(",") if p.strip()]
+
+            for conn_id, conn in connections.items():
+                name = conn.get("name", "")
+                for pattern in patterns:
+
+                    try:
+                        if re.search(pattern, name, re.IGNORECASE):
+                            items_to_delete.append(
+                                {"type": "connection", "id": conn_id, "name": name}
+                            )
+                            break
+                    except re.error:
+                        # If regex is invalid, treat as literal string
+                        if pattern.lower() in name.lower():
+                            items_to_delete.append(
+                                {"type": "connection", "id": conn_id, "name": name}
+                            )
+                            break
+
+        # Find matching groups
+        if group_pattern:
+            groups = guac_api.get_connection_groups()
+            patterns = [p.strip() for p in group_pattern.split(",") if p.strip()]
+
+            for group_id, group in groups.items():
+                name = group.get("name", "")
+                for pattern in patterns:
+
+                    try:
+                        if re.search(pattern, name, re.IGNORECASE):
+                            items_to_delete.append(
+                                {"type": "group", "id": group_id, "name": name}
+                            )
+                            break
+                    except re.error:
+                        # If regex is invalid, treat as literal string
+                        if pattern.lower() in name.lower():
+                            items_to_delete.append(
+                                {"type": "group", "id": group_id, "name": name}
+                            )
+                            break
+
+    if not items_to_delete:
+        console.print("[yellow]No items found matching the specified patterns[/yellow]")
+        return False
+
+    # Show what will be deleted
+    if not force:
+        console.print(
+            f"\n[red]⚠ CONFIRMING DELETION OF {len(items_to_delete)} ITEM(S)[/red]"
+        )
+        for item in items_to_delete:
+            console.print(f"  • {item['type'].title()}: {item['name']}")
+
+        confirm = Prompt.ask("\n[red]Type 'DELETE' to confirm[/red]").strip()
+        if confirm != "DELETE":
+            console.print("[yellow]Deletion cancelled[/yellow]")
+            return False
+
+    # Perform deletions
+    success_count = 0
+    for item in items_to_delete:
+        try:
+            if item["type"] == "connection":
+                if guac_api.delete_connection(item["id"]):
+                    console.print(
+                        f"[green]✓ Deleted connection: {item['name']}[/green]"
+                    )
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete connection: {item['name']}[/red]"
+                    )
+            elif item["type"] == "group":
+                if guac_api.delete_connection_group(item["id"]):
+                    console.print(f"[green]✓ Deleted group: {item['name']}[/green]")
+                    success_count += 1
+                else:
+                    console.print(
+                        f"[red]✗ Failed to delete group: {item['name']}[/red]"
+                    )
+        except Exception as e:
+            console.print(f"[red]✗ Error deleting {item['name']}: {e}[/red]")
+
+    console.print(
+        f"\n[green]Successfully deleted: {success_count}/{len(items_to_delete)} items[/green]"
+    )
+    return success_count > 0
+
+
+@app.command("add")
+def add_vm(
+    vm_id: int = typer.Option(None, "--vm-id", "--vmid", help="Proxmox VM ID to add"),
+    node: str = typer.Option(None, "--node", help="Proxmox node name"),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve",
+        "--yes",
+        "-y",
+        help="Skip interactive prompts and auto-approve actions",
+    ),
+    hostname: str = typer.Option(
+        None, "--hostname", help="Override detected hostname/IP"
+    ),
+    default_protocol: str = typer.Option(
+        None, "--protocol", help="Default protocol for connections (rdp/vnc/ssh)"
+    ),
+    default_port: int = typer.Option(
+        None, "--port", help="Default port for connections"
+    ),
+    enable_wol: bool = typer.Option(
+        None,
+        "--wol/--no-wol",
+        help="Enable/disable Wake-on-LAN (auto-detected if not specified)",
+    ),
+    mac_address: str = typer.Option(None, "--mac", help="MAC address for Wake-on-LAN"),
+    start_vm: bool = typer.Option(
+        None,
+        "--start-vm/--no-start-vm",
+        help="Auto-start stopped VMs (default: prompt)",
+    ),
+    restore_power: bool = typer.Option(
+        None,
+        "--restore-power/--no-restore-power",
+        help="Restore original VM power state after setup (default: prompt)",
+    ),
+) -> None:
+    """Add new VM connection to Guacamole"""
+    try:
+        # Set global flags for non-interactive mode
+        global auto_approve_mode, start_vm_auto, restore_power_auto
+        if auto_approve:
+            auto_approve_mode = True
+        if start_vm is not None:  # type: ignore[comparison-overlap]
+            start_vm_auto = start_vm
+        if restore_power is not None:  # type: ignore[comparison-overlap]
+            restore_power_auto = restore_power
+
+        # If VM ID and node are provided, we can run non-interactively
+        if vm_id is not None and node is not None:  # type: ignore[comparison-overlap]
+            result = interactive_add_vm(
+                auto_approve=auto_approve,
+                override_hostname=hostname,
+                override_protocol=default_protocol,
+                override_port=default_port,
+                override_wol=enable_wol,
+                override_mac=mac_address,
+                specific_vm_id=vm_id,
+                specific_node=node,
+            )
+        else:
+            # Fall back to interactive mode if required parameters missing
+            result = interactive_add_vm(auto_approve=auto_approve)
+
+        if result is False:
+            console.print("[yellow]Operation cancelled - returning to shell.[/yellow]")
+            return
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Operation cancelled by user.[/yellow]")
+        raise typer.Exit()
+    except Exception as e:
+        console.print(f"[red]Error adding VM: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("add-external")
+def add_external_host(
+    hostname: str = typer.Option(
+        None, "--hostname", "-H", help="Hostname or IP address of the external host"
+    ),
+    name: str = typer.Option(None, "--name", help="Display name for the connection"),
+    username: str = typer.Option(
+        None, "--username", "-u", help="Username for the connection"
+    ),
+    password: str = typer.Option(
+        None,
+        "--password",
+        "-p",
+        help="Password for the connection (use --password-stdin for secure input)",
+    ),
+    password_stdin: bool = typer.Option(
+        False, "--password-stdin", help="Read password from stdin"
+    ),
+    protocol: str = typer.Option(
+        "rdp", "--protocol", "-P", help="Protocol to use (rdp/vnc/ssh)"
+    ),
+    port: int = typer.Option(None, "--port", help="Port number for the connection"),
+    enable_wol: bool = typer.Option(False, "--wol/--no-wol", help="Enable Wake-on-LAN"),
+    mac_address: str = typer.Option(None, "--mac", help="MAC address for Wake-on-LAN"),
+    connection_name: str = typer.Option(
+        None, "--connection-name", help="Custom connection name"
+    ),
+    auto_approve: bool = typer.Option(
+        False, "--auto-approve", "--yes", "-y", help="Skip interactive prompts"
+    ),
+) -> None:
+    """Add a non-Proxmox external host connection to Guacamole"""
+    try:
+        # Handle password input
+        if password_stdin:
+
+            password = sys.stdin.read().strip()
+        elif password is None and not auto_approve:  # type: ignore[comparison-overlap]
+
+            password = getpass.getpass("Password: ")
+
+        # Validate required parameters and prompt if missing
+        if not hostname:
+            hostname = input("Hostname/IP address: ").strip()
+            if not hostname:
+                console.print("[red]Error: Hostname is required[/red]")
+                raise typer.Exit(1)
+        if not username:
+            username = input("Username: ").strip()
+        if not password and not password_stdin:
+
+            password = getpass.getpass("Password: ")
+
+        # Set defaults
+        if port is None:  # type: ignore[comparison-overlap]
+            if protocol == "rdp":
+                port = 3389
+            elif protocol == "ssh":
+                port = 22
+            elif protocol == "vnc":
+                port = 5900
+
+        if name is None:  # type: ignore[comparison-overlap]
+            name = hostname
+
+        # Create external host config
+        external_config: Dict[str, Any] = {
+            "hostname": hostname,
+            "name": name,
+            "username": username,
+            "password": password,
+            "protocol": protocol,
+            "port": port,
+            "enable_wol": enable_wol,
+            "mac_address": mac_address,
+            "connection_name": connection_name or f"{name}-{username}-{protocol}",
+        }
+
+        result = interactive_add_vm(
+            start_external=True,
+            auto_approve=auto_approve,
+            external_config=external_config,
+        )
+        if result is False:
+            console.print("[yellow]Operation cancelled - returning to shell.[/yellow]")
+            return
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Operation cancelled by user.[/yellow]")
+        raise typer.Exit()
+    except Exception as e:
+        console.print(f"[red]Error adding external host: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("list")
+def list_connections_cmd(
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable verbose logging"
+    ),
+    log_file: str = typer.Option(None, "--log-file", help="Log verbose output to file"),
+    filter_connection: str = typer.Option(
+        None,
+        "--connection",
+        "-c",
+        help="Filter by connection name pattern (supports regex)",
+    ),
+    filter_vm: str = typer.Option(
+        None, "--vm", help="Filter connections by VM name pattern (supports regex)"
+    ),
+    filter_protocol: str = typer.Option(
+        None, "--protocol", "-p", help="Filter connections by protocol (rdp/vnc/ssh)"
+    ),
+    filter_status: str = typer.Option(
+        None, "--status", help="Filter by sync status (ok/out-of-sync/error)"
+    ),
+    filter_group: str = typer.Option(
+        None,
+        "--group",
+        help="Filter connections by group name pattern (supports regex)",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+    csv_output: str = typer.Option(None, "--csv", help="Output to CSV file"),
+) -> None:
+    """List existing Guacamole connections with advanced filtering"""
+    global verbose_mode, verbose_log_file
+    # Only set verbose mode if not already set by global options
+    if not verbose_mode:
+        verbose_mode = verbose or (log_file is not None)  # type: ignore[comparison-overlap]
+    if log_file:
+        verbose_log_file = log_file
+    try:
+        list_connections(
+            filter_vm=filter_vm,
+            filter_protocol=filter_protocol,
+            filter_status=filter_status,
+            filter_group=filter_group,
+            filter_connection=filter_connection,
+            json_output=json_output,
+            csv_output=csv_output,
+        )
+    except Exception as e:
+        console.print(f"[red]Error listing connections: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("test-auth")
+def test_auth(
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable verbose logging"
+    ),
+    log_file: str = typer.Option(None, "--log-file", help="Log verbose output to file"),
+) -> None:
+    """Test API Authentication (Both Proxmox and Guacamole)"""
+    global verbose_mode, verbose_log_file
+    # Only set verbose mode if not already set by global options
+    if not verbose_mode:
+        verbose_mode = verbose or (log_file is not None)  # type: ignore[comparison-overlap]
+    if log_file:
+        verbose_log_file = log_file
+
+    # Create header panel
+    console.print(
+        Panel.fit(
+            Text(" API Authentication Test", style="bold cyan"),
+            border_style="cyan",
+            padding=(0, 2),
+        )
+    )
+
+    try:
+        config = Config()
+        all_passed = True
+
+        # Step 1: Encryption Key Validation
+        console.print("\n[bold]● Testing API Authentication[/bold]")
+
+        step_symbol = "✓"
+        try:
+
+            key = getattr(config, "ENCRYPTION_KEY", None)
+            if key:
+                f = Fernet(key)
+                test_plain = b"verification-test"
+                token = f.encrypt(test_plain)
+                if f.decrypt(token) == test_plain:
+                    console.print(
+                        f"[green]{step_symbol}[/green] Validating encryption key"
+                    )
+                else:
+                    console.print("[red]✗[/red] Encryption key round-trip failed")
+                    all_passed = False
+            else:
+                console.print("[yellow]⚠[/yellow] No encryption key configured")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Encryption key validation failed: {e}")
+            all_passed = False
+
+        # Step 2: Guacamole Authentication
+        try:
+            guac_api = GuacamoleAPI(config)
+            if guac_api.authenticate(silent=True):
+                console.print(
+                    f"[green]{step_symbol}[/green] Testing Guacamole authentication"
+                )
+            else:
+                console.print("[red]✗[/red] Guacamole authentication failed")
+                all_passed = False
+        except Exception as e:
+            console.print(f"[red]✗[/red] Guacamole authentication error: {e}")
+            all_passed = False
+
+        # Step 3: Proxmox Authentication
+        try:
+            proxmox_api = ProxmoxAPI(config)
+            # Override the test_auth to not print its own panel
+            response = proxmox_api._make_request_with_spinner(  # type: ignore[attr-defined]
+                "get", f"{config.proxmox_base_url}/version"
+            )
+            if response.status_code == 200:
+                console.print(
+                    f"[green]{step_symbol}[/green] Testing Proxmox authentication"
+                )
+            else:
+                console.print(
+                    f"[red]✗[/red] Proxmox authentication failed: HTTP {response.status_code}"
+                )
+                all_passed = False
+        except Exception as e:
+            console.print(f"[red]✗[/red] Proxmox authentication error: {e}")
+            all_passed = False
+
+        # Final result
+        if all_passed:
+            console.print(
+                f"\n[green]{step_symbol}[/green] All authentication tests passed"
+            )
+            console.print("\n[dim]Ready to sync VM connections![/dim]")
+        else:
+            console.print("\n[red]✗[/red] Some authentication tests failed")
+            console.print("\n[dim]Please check your configuration and try again.[/dim]")
+            raise typer.Exit(1)
+
+    except Exception as e:
+        console.print(f"\n[red]✗ Error during authentication testing: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("debug-vms")
+def debug_vms() -> None:
+    """Debug VM listing with full API response"""
+    try:
+        config = Config()
+        proxmox_api = ProxmoxAPI(config)
+        nodes = proxmox_api.get_nodes()
+
+        for node in nodes:
+            node_name = node["node"]
+
+            console.print(Panel(f"Node: [cyan]{node_name}[/cyan]", border_style="blue"))
+
+            # Check QEMU VMs
+            qemu_url = f"{config.proxmox_base_url}/nodes/{node_name}/qemu"
+            qemu_response = proxmox_api.session.get(qemu_url)
+
+            table = Table(title="QEMU VMs Debug Info")
+            table.add_column("Property", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("URL", qemu_url)
+            table.add_row("Status Code", str(qemu_response.status_code))
+            table.add_row(
+                "Response",
+                (
+                    qemu_response.text[:200] + "..."
+                    if len(qemu_response.text) > 200
+                    else qemu_response.text
+                ),
+            )
+            console.print(table)
+
+            # Check LXC containers
+            lxc_url = f"{config.proxmox_base_url}/nodes/{node_name}/lxc"
+            lxc_response = proxmox_api.session.get(lxc_url)
+
+            table = Table(title="LXC Containers Debug Info")
+            table.add_column("Property", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("URL", lxc_url)
+            table.add_row("Status Code", str(lxc_response.status_code))
+            table.add_row(
+                "Response",
+                (
+                    lxc_response.text[:200] + "..."
+                    if len(lxc_response.text) > 200
+                    else lxc_response.text
+                ),
+            )
+            console.print(table)
+
+    except Exception as e:
+        console.print(f"[red]Error debugging VMs: {e}[/red]")
+        raise typer.Exit(1)
+
+
+def _test_socket_connection(hostname: str, port: int, timeout: float) -> Tuple[bool, str]:
+    """Test basic TCP socket connectivity"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((hostname, port))
+        sock.close()
+
+        if result == 0:
+            return True, ""
+        else:
+            return False, f"Connection refused (error code: {result})"
+    except socket.timeout:
+        return False, f"Timeout after {timeout}s"
+    except socket.gaierror:
+        return False, "DNS resolution failed"
+    except Exception as e:
+        return False, str(e)
+
+
+def _test_ssh_connection(hostname: str, port: int, username: str, password: str, timeout: float) -> Tuple[bool, str]:
+    """Test SSH connection with authentication (cross-platform: Windows/macOS/Linux)"""
+    try:
+        import paramiko
+
+        # Disable paramiko logging to avoid clutter
+        import logging
+        logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            client.connect(
+                hostname=hostname,
+                port=port,
+                username=username,
+                password=password,
+                timeout=timeout,
+                allow_agent=False,
+                look_for_keys=False,
+                banner_timeout=timeout
+            )
+            client.close()
+            return True, ""
+        except paramiko.AuthenticationException:
+            return False, "Authentication failed - invalid credentials"
+        except paramiko.SSHException as e:
+            error_str = str(e).lower()
+            if "connection refused" in error_str:
+                return False, "Connection refused - SSH service not running"
+            elif "no existing session" in error_str or "no route to host" in error_str:
+                return False, f"Network unreachable: {str(e)}"
+            return False, f"SSH error: {str(e)}"
+        except socket.timeout:
+            return False, f"Connection timeout after {timeout}s"
+        except socket.error as e:
+            return False, f"Socket error: {str(e)}"
+        except Exception as e:
+            return False, f"Connection error: {str(e)}"
+    except ImportError:
+        # Fallback to socket test
+        sock_success, sock_error = _test_socket_connection(hostname, port, timeout)
+        if sock_success:
+            return True, "SSH port open (paramiko not installed for full auth test)"
+        return False, f"{sock_error} (install paramiko for auth testing)"
+
+
+def _test_rdp_connection(hostname: str, port: int, username: str, password: str, timeout: float) -> Tuple[bool, str]:
+    """Test RDP connection with authentication (cross-platform: Windows/macOS/Linux)"""
+    try:
+        import winrm
+        from winrm.protocol import Protocol
+
+        # Suppress winrm warnings
+        import warnings
+        warnings.filterwarnings('ignore', module='winrm')
+
+        # Try WinRM first (often enabled alongside RDP)
+        # Format username for NTLM if needed (DOMAIN\user or user@domain)
+        winrm_username = username
+
+        try:
+            # Try HTTPS WinRM port (5986) first
+            endpoint = f'https://{hostname}:5986/wsman'
+            protocol = Protocol(
+                endpoint=endpoint,
+                transport='ntlm',
+                username=winrm_username,
+                password=password,
+                server_cert_validation='ignore',
+                read_timeout_sec=int(timeout),
+                operation_timeout_sec=int(timeout)
+            )
+            shell_id = protocol.open_shell()
+            protocol.close_shell(shell_id)
+            return True, ""
+        except Exception as https_err:
+            # Try HTTP WinRM port (5985)
+            try:
+                endpoint = f'http://{hostname}:5985/wsman'
+                protocol = Protocol(
+                    endpoint=endpoint,
+                    transport='ntlm',
+                    username=winrm_username,
+                    password=password,
+                    read_timeout_sec=int(timeout),
+                    operation_timeout_sec=int(timeout)
+                )
+                shell_id = protocol.open_shell()
+                protocol.close_shell(shell_id)
+                return True, ""
+            except Exception as http_err:
+                # Check if it's an auth failure
+                error_msg = str(http_err).lower()
+                if "401" in error_msg or "unauthorized" in error_msg or "auth" in error_msg:
+                    return False, "Authentication failed - invalid credentials"
+
+                # If WinRM fails, test if RDP port is open
+                sock_success, sock_error = _test_socket_connection(hostname, port, timeout)
+                if sock_success:
+                    return True, "RDP port open (WinRM unavailable for full auth test)"
+                else:
+                    return False, f"RDP port closed, WinRM unavailable"
+    except ImportError:
+        # Fallback to socket test if pywinrm not installed
+        sock_success, sock_error = _test_socket_connection(hostname, port, timeout)
+        if sock_success:
+            return True, "RDP port open (pywinrm not installed for full auth test)"
+        return False, f"{sock_error} (install pywinrm for auth testing)"
+
+
+def _test_vnc_connection(hostname: str, port: int, password: str, timeout: float) -> Tuple[bool, str]:
+    """Test VNC connection (cross-platform: Windows/macOS/Linux)"""
+    sock = None
+    try:
+        # VNC protocol handshake test
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((hostname, port))
+
+        # Read VNC server version (12 bytes: "RFB XXX.YYY\n")
+        version = sock.recv(12)
+        if not version or len(version) < 12:
+            sock.close()
+            return False, "Invalid VNC server response - incomplete version"
+
+        if not version.startswith(b'RFB '):
+            sock.close()
+            return False, "Invalid VNC server response - not RFB protocol"
+
+        # Send client version back
+        sock.sendall(version)
+
+        # Read security types
+        num_sec_types = sock.recv(1)
+        if len(num_sec_types) == 0:
+            sock.close()
+            return False, "VNC connection failed - no security types"
+
+        num_types = ord(num_sec_types) if isinstance(num_sec_types, bytes) else num_sec_types
+        if num_types == 0:
+            # Connection failed - read reason
+            try:
+                reason_length = int.from_bytes(sock.recv(4), 'big')
+                reason = sock.recv(reason_length).decode('utf-8', errors='ignore')
+                sock.close()
+                return False, f"VNC connection rejected: {reason}"
+            except Exception:
+                if sock:
+                    sock.close()
+                return False, "VNC connection rejected by server"
+
+        # Successfully connected and got security types
+        if sock:
+            sock.close()
+        return True, ""
+
+    except socket.timeout:
+        if sock:
+            sock.close()
+        return False, f"Connection timeout after {timeout}s"
+    except socket.gaierror:
+        if sock:
+            sock.close()
+        return False, "DNS resolution failed"
+    except socket.error as e:
+        if sock:
+            sock.close()
+        return False, f"Socket error: {str(e)}"
+    except Exception as e:
+        if sock:
+            sock.close()
+        return False, f"VNC handshake error: {str(e)}"
+    finally:
+        # Ensure socket is always closed
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+@app.command("test-network")
+def test_network(
+    mac: str = typer.Argument(..., help="MAC address to scan for on the network")
+) -> None:
+    """Test network scanning for specific MAC address"""
+    try:
+        console.print(
+            f"[cyan]Testing network scan for MAC:[/cyan] [yellow]{mac}[/yellow]"
+        )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Scanning network...", total=None)
+            result = NetworkScanner.find_mac_on_network(mac)
+            progress.update(task, completed=True)
+
+        if result:
+            table = Table(title=" Network Scan Result")
+            table.add_column("Property", style="cyan")
+            table.add_column("Value", style="green")
+            table.add_row("IP Address", result["ip"])
+            table.add_row("Hostname", result.get("hostname", "N/A"))
+            console.print(table)
+        else:
+            console.print(
+                Panel(" MAC address not found on network", border_style="red")
+            )
+    except Exception as e:
+        console.print(f"[red]Error testing network: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("test-connectivity")
+def test_connectivity(
+    connection_pattern: Optional[str] = typer.Option(
+        None, "--connection", "-c", help="Connection name pattern (regex)"
+    ),
+    protocol: Optional[str] = typer.Option(
+        None, "--protocol", "-p", help="Filter by protocol (rdp/ssh/vnc)"
+    ),
+    timeout: float = typer.Option(
+        5.0, "--timeout", "-t", help="Connection timeout in seconds"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Show detailed connection information"
+    ),
+    test_auth: bool = typer.Option(
+        True, "--test-auth/--no-test-auth", help="Test actual protocol authentication (not just socket)"
+    ),
+    auto_start_vms: bool = typer.Option(
+        True, "--auto-start-vms/--no-auto-start-vms", help="Auto-start stopped Proxmox VMs during test"
+    ),
+) -> None:
+    """Test connectivity to Guacamole connections with protocol-level validation"""
+    try:
+        config = Config()
+        guac_api = GuacamoleAPI(config)
+
+        if not guac_api.authenticate():
+            console.print("[red]Failed to authenticate with Guacamole[/red]")
+            raise typer.Exit(1)
+
+        console.print(
+            Panel.fit(
+                Text("⬢ Connectivity Test", style="bold cyan"),
+                border_style="cyan",
+                padding=(0, 2),
+            )
+        )
+
+        # Get all connections
+        connections = guac_api.get_connections()
+
+        if not connections:
+            console.print("[yellow]No connections found[/yellow]")
+            return
+
+        # Build connection-to-VM mapping for Proxmox VMs
+        connection_to_vm_info: Dict[str, Tuple[str, int]] = {}
+        proxmox_api = None
+        if auto_start_vms:
+            console.print("[dim]Building Proxmox VM mapping...[/dim]")
+            connection_to_vm_info = _build_connection_to_vm_mapping(config, guac_api)
+            if connection_to_vm_info:
+                console.print(
+                    f"[dim]Found {len(connection_to_vm_info)} Proxmox-managed connections[/dim]"
+                )
+                proxmox_api = ProxmoxAPI(config)
+
+        # Filter connections and fetch detailed parameters
+        filtered_connections = []
+        console.print(f"\n[dim]Fetching connection details...[/dim]")
+
+        for conn_id, conn_data in connections.items():
+            conn_name = conn_data.get("name", "")
+            conn_protocol = conn_data.get("protocol", "")
+
+            # Apply filters
+            if connection_pattern:
+                if not re.search(connection_pattern, conn_name, re.IGNORECASE):
+                    continue
+
+            if protocol:
+                if conn_protocol.lower() != protocol.lower():
+                    continue
+
+            # Fetch detailed connection parameters
+            detailed_conn = guac_api.get_connection_details(conn_id)
+            if detailed_conn:
+                filtered_connections.append((conn_id, detailed_conn))
+            else:
+                # Fallback to basic data if details fetch fails
+                filtered_connections.append((conn_id, conn_data))
+
+        if not filtered_connections:
+            console.print("[yellow]No connections match the specified filters[/yellow]")
+            return
+
+        test_mode = "Protocol Authentication" if test_auth else "Socket Connectivity"
+        console.print(f"\n[bold]Testing {len(filtered_connections)} connection(s) - Mode: {test_mode}[/bold]\n")
+
+        # Test each connection
+        results = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Testing connections...", total=len(filtered_connections))
+
+            for conn_id, conn_data in filtered_connections:
+                conn_name = conn_data.get("name", "Unknown")
+                conn_protocol = conn_data.get("protocol", "unknown")
+                parameters = conn_data.get("parameters", {})
+
+                # Extract connection parameters with fallbacks for different Guacamole versions
+                hostname = parameters.get("hostname") or parameters.get("host") or ""
+                port = parameters.get("port") or ""
+                username = parameters.get("username") or parameters.get("user") or ""
+                password = parameters.get("password") or parameters.get("passwd") or ""
+
+                # If parameters are missing, try to get from top-level connection data
+                if not hostname:
+                    hostname = conn_data.get("hostname", "")
+                if not port:
+                    port = conn_data.get("port", "")
+                if not username:
+                    username = conn_data.get("username", "")
+
+                progress.update(task, description=f"Testing {conn_name}...")
+
+                # Check if this is a Proxmox VM and ensure it's running
+                if auto_start_vms and conn_name in connection_to_vm_info and proxmox_api:
+                    node_name, vm_id = connection_to_vm_info[conn_name]
+                    vm_start_success, vm_start_error = _ensure_proxmox_vm_running(
+                        config, proxmox_api, node_name, vm_id, conn_name, timeout
+                    )
+                    if not vm_start_success:
+                        # VM couldn't be woken via WoL, record error and skip
+                        results.append({
+                            "name": conn_name,
+                            "protocol": conn_protocol,
+                            "hostname": hostname,
+                            "port": port,
+                            "username": username,
+                            "success": False,
+                            "latency_ms": None,
+                            "error": vm_start_error,
+                            "auth_result": "WoL Failed"
+                        })
+                        progress.advance(task)
+                        continue
+
+                # Test connectivity
+                success = False
+                error_msg = ""
+                latency_ms = None
+                auth_result = "N/A"
+
+                if hostname and port:
+                    try:
+                        # Convert port to int, handling string values
+                        try:
+                            port_int = int(port)
+                            if port_int <= 0 or port_int > 65535:
+                                raise ValueError(f"Invalid port number: {port_int}")
+                        except (ValueError, TypeError) as port_err:
+                            error_msg = f"Invalid port value: {port}"
+                            auth_result = "Config Error"
+                            results.append({
+                                "name": conn_name,
+                                "protocol": conn_protocol,
+                                "hostname": hostname,
+                                "port": port,
+                                "username": username,
+                                "success": False,
+                                "latency_ms": None,
+                                "error": error_msg,
+                                "auth_result": auth_result
+                            })
+                            progress.advance(task)
+                            continue
+
+                        start_time = time.time()
+
+                        if test_auth:
+                            # Protocol-specific authentication tests
+                            if conn_protocol.lower() == "ssh":
+                                success, error_msg = _test_ssh_connection(
+                                    hostname, port_int, username, password, timeout
+                                )
+                                auth_result = "Auth OK" if success else "Auth Failed"
+                            elif conn_protocol.lower() == "rdp":
+                                success, error_msg = _test_rdp_connection(
+                                    hostname, port_int, username, password, timeout
+                                )
+                                auth_result = "Auth OK" if success else "Auth Failed"
+                            elif conn_protocol.lower() == "vnc":
+                                success, error_msg = _test_vnc_connection(
+                                    hostname, port_int, password, timeout
+                                )
+                                auth_result = "Auth OK" if success else "Auth Failed"
+                            else:
+                                # Fallback to socket test for unknown protocols
+                                success, error_msg = _test_socket_connection(
+                                    hostname, port_int, timeout
+                                )
+                                auth_result = "Port Open" if success else "Port Closed"
+                        else:
+                            # Socket-only test
+                            success, error_msg = _test_socket_connection(
+                                hostname, port_int, timeout
+                            )
+                            auth_result = "Port Open" if success else "Port Closed"
+
+                        end_time = time.time()
+                        latency_ms = round((end_time - start_time) * 1000, 2)
+
+                    except socket.timeout:
+                        error_msg = f"Timeout after {timeout}s"
+                        auth_result = "Timeout"
+                    except socket.gaierror:
+                        error_msg = "DNS resolution failed"
+                        auth_result = "DNS Error"
+                    except Exception as e:
+                        error_msg = str(e)
+                        auth_result = "Error"
+                else:
+                    # Provide more specific error message
+                    if not hostname and not port:
+                        error_msg = "Missing hostname and port in connection config"
+                    elif not hostname:
+                        error_msg = "Missing hostname in connection config"
+                    elif not port:
+                        error_msg = "Missing port in connection config"
+                    else:
+                        error_msg = "Missing hostname or port"
+                    auth_result = "Config Error"
+
+                results.append({
+                    "name": conn_name,
+                    "protocol": conn_protocol,
+                    "hostname": hostname,
+                    "port": port,
+                    "username": username,
+                    "success": success,
+                    "latency_ms": latency_ms,
+                    "error": error_msg,
+                    "auth_result": auth_result
+                })
+
+                progress.advance(task)
+
+        # Display results
+        console.print("\n[bold]● Connectivity Test Results[/bold]\n")
+
+        # Create summary table
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Connection", style="white", no_wrap=False)
+        table.add_column("Protocol", style="cyan", justify="center")
+        table.add_column("Endpoint", style="yellow")
+        table.add_column("Status", justify="center")
+        table.add_column("Auth", justify="center")
+        table.add_column("Latency", justify="right")
+
+        success_count = 0
+        fail_count = 0
+
+        for result in results:
+            status_icon = "✓" if result["success"] else "✗"
+            status_color = "green" if result["success"] else "red"
+
+            endpoint = f"{result['hostname']}:{result['port']}" if result['hostname'] else "N/A"
+
+            auth_status = result.get('auth_result', 'N/A')
+            auth_color = "green" if result['success'] else "red" if "Failed" in auth_status else "yellow"
+
+            latency_str = ""
+            if result['success'] and result['latency_ms'] is not None:
+                latency_str = f"{result['latency_ms']}ms"
+            elif result['error']:
+                latency_str = f"[dim]{result['error'][:30]}[/dim]"
+
+            table.add_row(
+                result['name'],
+                result['protocol'].upper(),
+                endpoint,
+                f"[{status_color}]{status_icon}[/{status_color}]",
+                f"[{auth_color}]{auth_status}[/{auth_color}]",
+                latency_str
+            )
+
+            if result['success']:
+                success_count += 1
+            else:
+                fail_count += 1
+
+        console.print(table)
+
+        # Summary
+        console.print(f"\n[bold]Summary:[/bold]")
+        console.print(f"  [green]✓[/green] Successful: {success_count}")
+        console.print(f"  [red]✗[/red] Failed: {fail_count}")
+        console.print(f"  Total tested: {len(results)}")
+
+        # Verbose output
+        if verbose and fail_count > 0:
+            console.print("\n[bold]Failed Connection Details:[/bold]")
+            for result in results:
+                if not result['success']:
+                    auth_status_verbose = result.get('auth_result', 'N/A')
+                    auth_color_verbose = "red" if "Failed" in auth_status_verbose else "yellow"
+                    console.print(f"\n[yellow]● {result['name']}[/yellow]")
+                    console.print(f"  Protocol: {result['protocol'].upper()}")
+                    console.print(f"  Endpoint: {result['hostname']}:{result['port']}")
+                    console.print(f"  Username: {result.get('username', 'N/A')}")
+                    console.print(f"  Auth Status: [{auth_color_verbose}]{auth_status_verbose}[/{auth_color_verbose}]")
+                    console.print(f"  Error: [red]{result['error']}[/red]")
+
+        # Exit with error code if any tests failed
+        if fail_count > 0:
+            raise typer.Exit(1)
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Error during connectivity test: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("auto")
+def auto_process(
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force mode: recreate all connections and overwrite duplicates",
+    ),
+    filter_node: str = typer.Option(
+        None, "--node", help="Process only VMs from specific Proxmox node"
+    ),
+    filter_vm: str = typer.Option(
+        None, "--vm", help="Process only specific VM by name/ID"
+    ),
+    skip_existing: bool = typer.Option(
+        True,
+        "--skip-existing/--no-skip-existing",
+        help="Skip VMs that already have connections",
+    ),
+    start_vms: bool = typer.Option(
+        None,
+        "--start-vms/--no-start-vms",
+        help="Auto-start stopped VMs for IP detection",
+    ),
+    restore_power: bool = typer.Option(
+        None,
+        "--restore-power/--no-restore-power",
+        help="Restore original VM power state after processing",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be done without making changes"
+    ),
+) -> None:
+    """Auto-process all VMs with credentials in notes"""
+    try:
+        auto_process_all_vms(
+            force=force,
+            filter_node=filter_node,
+            filter_vm=filter_vm,
+            skip_existing=skip_existing,
+            start_vms=start_vms,
+            restore_power=restore_power,
+            dry_run=dry_run,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Auto-processing cancelled by user.[/yellow]")
+        raise typer.Exit()
+    except Exception as e:
+        console.print(f"[red]Error in auto-processing: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("repair")
+def auto_repair_command(
+    vm_filter: str = typer.Option(
+        None,
+        "--vm-filter",
+        "-v",
+        help="Only repair VMs whose name or VMID matches this substring or regex",
+    ),
+    auto_approve: bool = typer.Option(
+        False,
+        "--auto-approve/--prompt",
+        help="Apply repairs immediately without asking for confirmation",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show the repair plan without applying any changes",
+    ),
+) -> None:
+    """Automatically repair out-of-sync connections based on Proxmox VM notes."""
+
+    try:
+        success = repair_out_of_sync(
+            auto_approve=auto_approve,
+            dry_run=dry_run,
+            vm_filter=vm_filter,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Repair cancelled by user.[/yellow]")
+        raise typer.Exit()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        console.print(f"[red]Failed to complete repair: {exc}[/red]")
+        raise typer.Exit(1)
+
+    if not success:
+        raise typer.Exit(1)
+
+
+@app.command("edit")
+def edit_connections_cmd(
+    connection_pattern: str = typer.Option(
+        None,
+        "--connection",
+        "-c",
+        help="Connection name pattern to edit (supports regex, comma-separated for multiple)",
+    ),
+    new_hostname: str = typer.Option(None, "--hostname", help="Update hostname/IP"),
+    new_username: str = typer.Option(None, "--username", "-u", help="Update username"),
+    new_password: str = typer.Option(None, "--password", "-p", help="Update password"),
+    new_port: int = typer.Option(None, "--port", help="Update port number"),
+    new_protocol: str = typer.Option(
+        None,
+        "--protocol",
+        help="Update protocol (rdp, vnc, ssh)",
+        autocompletion=complete_protocols,
+    ),
+    enable_wol: bool = typer.Option(
+        None, "--wol/--no-wol", help="Enable/disable Wake-on-LAN"
+    ),
+    new_mac: str = typer.Option(None, "--mac", help="Update MAC address for WoL"),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Skip confirmation prompts"
+    ),
+) -> None:
+    """Edit existing Guacamole connections with pattern matching"""
+    try:
+        if connection_pattern:
+            # Non-interactive mode: update connections matching pattern
+            edit_connections_by_pattern(
+                connection_pattern=connection_pattern,
+                new_hostname=new_hostname,
+                new_username=new_username,
+                new_password=new_password,
+                new_port=new_port,
+                new_protocol=new_protocol,
+                enable_wol=enable_wol,
+                new_mac=new_mac,
+                force=force,
+            )
+        else:
+            # Interactive mode
+            edit_connections_interactive()
+    except Exception as e:
+        console.print(f"[red]Error in edit mode: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("autogroup")
+def autogroup_connections_cmd() -> None:
+    """Automatically group connections using smart pattern analysis"""
+    try:
+        autogroup_connections()
+    except Exception as e:
+        console.print(f"[red]Error in autogroup mode: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("delete")
+def delete_connections_cmd(
+    connection_pattern: str = typer.Option(
+        None,
+        "--connection",
+        "-c",
+        help="Connection name pattern to delete (supports regex, comma-separated for multiple)",
+    ),
+    group_pattern: str = typer.Option(
+        None,
+        "--group",
+        "-g",
+        help="Connection group name pattern to delete (supports regex, comma-separated for multiple)",
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Skip confirmation prompts"
+    ),
+    delete_all: bool = typer.Option(
+        False, "--all", help="Delete all connections and groups (dangerous!)"
+    ),
+) -> None:
+    """Delete Guacamole connections and groups with pattern matching"""
+    try:
+        if connection_pattern or group_pattern or delete_all:
+            # Non-interactive mode
+            delete_connections_by_pattern(
+                connection_pattern=connection_pattern,
+                group_pattern=group_pattern,
+                force=force,
+                delete_all=delete_all,
+            )
+        else:
+            # Interactive mode
+            delete_connections_interactive()
+    except Exception as e:
+        console.print(f"[red]Error in delete mode: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command("interactive")
+def interactive_menu() -> None:
+    """Interactive menu mode"""
+    
+    # raw_mode is now set globally via callback
+
+    if (
+        os.environ.get("PYTEST_CURRENT_TEST")
+        or os.environ.get("GUAC_SKIP_INTERACTIVE")
+        or os.environ.get("CI")
+    ):
+        return
+
+    # Enhanced welcome header (conditional formatting)
+    # Get the current username
+    import getpass
+    username = getpass.getuser()
+    
+    if raw_mode:
+        print("\n" + "=" * 60)
+        print(f"  Proxmox-Guacamole Sync - Welcome, {username}!")
+        print("=" * 60 + "\n")
+    else:
+        header_text = Text("Proxmox-Guacamole Sync", style="bold cyan", justify="center")
+        console.print(
+            Panel(
+                header_text,
+                border_style="cyan",
+                title=f"[bold]Welcome, {username}![/bold]",
+                padding=(1, 2),
+            )
+        )
+
+    try:
+        while True:
+            smart_actions, smart_messages = compute_smart_actions()
+            smart_lookup = {action.key: action for action in smart_actions}
+
+            # Enhanced menu with better visual structure
+            # Organize menu into logical sections with navigation support
+            menu_options: List[Tuple[str, str]] = []
+
+            if smart_messages or smart_actions:
+                menu_options.append(("", "═══ Smart Suggestions ═══"))
+                for message in smart_messages:
+                    menu_options.append(("", message))
+                for action in smart_actions:
+                    menu_options.append((action.key, _format_smart_action_label(action)))
+
+            # Menu items with conditional hexagon icons based on raw_mode
+            if raw_mode:
+                menu_options.extend(
+                    [
+                        ("", "═══ Connection Management ═══"),
+                        ("1", "● View existing connections"),
+                        ("2", "● Edit or delete connections"),
+                        ("3", "● Test connection connectivity"),
+                        ("", "═══ Proxmox Sync ═══"),
+                        ("4", "● Select Proxmox VM to add"),
+                        ("5", "● Auto-sync all VMs with credentials"),
+                        ("", "═══ External Hosts ═══"),
+                        ("6", "● Add external (non-Proxmox) host"),
+                        ("", "═══ Tools & Help ═══"),
+                        ("7", "● View available CLI commands"),
+                        ("0", "● Exit to shell"),
+                    ]
+                )
+            else:
+                menu_options.extend(
+                    [
+                        ("", "═══ Connection Management ═══"),
+                        ("1", "[bold green]⬢[/bold green] ● View existing connections"),
+                        ("2", "[bold green]⬢[/bold green] ● Edit or delete connections"),
+                        ("3", "[bold cyan]⬢[/bold cyan] ● Test connection connectivity"),
+                        ("", "═══ Proxmox Sync ═══"),
+                        ("4", "[bold orange1]⬢[/bold orange1]→[bold green]⬢[/bold green] ● Select Proxmox VM to add"),
+                        ("5", "[bold orange1]⬢[/bold orange1]→[bold green]⬢[/bold green] ● Auto-sync all VMs with credentials"),
+                        ("", "═══ External Hosts ═══"),
+                        ("6", "[bold green]⬢[/bold green] ● Add external (non-Proxmox) host"),
+                        ("", "═══ Tools & Help ═══"),
+                        ("7", "● View available CLI commands"),
+                        ("0", "● Exit to shell"),
+                    ]
+                )
+
+            # Use enhanced navigation
+            choice = interactive_menu_with_navigation(
+                menu_options, "Guacamole VM Manager - Select Action"
+            )
+
+            if choice in smart_lookup:
+                action = smart_lookup[choice]
+                if raw_mode:
+                    print(f"\nExecuting: {_format_smart_action_label(action)}")
+                else:
+                    console.print(
+                        Panel(
+                            f"Executing: {_format_smart_action_label(action)}",
+                            border_style="cyan",
+                        )
+                    )
+                if action.detail:
+                    if raw_mode:
+                        print(action.detail)
+                    else:
+                        console.print(action.detail)
+                try:
+                    action.handler()
+                    if raw_mode:
+                        print("\n✓ Smart action completed. Press Enter to refresh suggestions.")
+                    else:
+                        console.print(
+                            "\n[green]✓ Smart action completed. Press Enter to refresh suggestions.[/green]"
+                        )
+                except KeyboardInterrupt:
+                    console.print(
+                        "\n[yellow]Smart action cancelled by user. Press Enter to return to menu.[/yellow]"
+                    )
+                except Exception as exc:
+                    console.print(
+                        Panel(
+                            f"[red]Smart action failed:[/red] {exc}",
+                            border_style="red",
+                        )
+                    )
+                console.input("[dim]Press Enter to continue...[/dim]")
+                continue
+
+            if choice == "1":
+                list_connections()
+                console.print(
+                    "\n[dim]Connection list complete. Returning to menu...[/dim]"
+                )
+                time.sleep(1.5)
+            elif choice == "2":
+                edit_connections_interactive()
+            elif choice == "3":
+                interactive_connectivity_test()
+            elif choice == "4":
+                interactive_add_vm()
+            elif choice == "5":
+                auto_process_all_vms(force=False)
+            elif choice == "6":
+                interactive_add_vm(start_external=True)
+            elif choice == "7":
+                # Enhanced CLI reference display
+                console.print(
+                    Panel.fit(
+                        "[bold]CLI Command Reference[/bold]",
+                        border_style="magenta",
+                        padding=(0, 2),
+                    )
+                )
+
+                cli_table = Table(show_header=True, header_style="bold magenta")
+                cli_table.add_column("Command", style="cyan", min_width=15)
+                cli_table.add_column("Description", style="white")
+
+                commands = [
+                    ("interactive", "Interactive menu (current mode)"),
+                    ("add", "Manually add one Proxmox VM"),
+                    ("auto", "Auto-process all VMs with credentials"),
+                    ("auto --force", "Force recreate all connections"),
+                    ("repair", "Auto-heal out-of-sync connections"),
+                    ("list", "List existing connections"),
+                    ("edit", "Edit and delete existing connections"),
+                    ("delete", "Delete connections and groups only"),
+                    ("autogroup", "Smart connection grouping"),
+                    ("test-auth", "Test API authentication"),
+                    ("test-connectivity", "Test connection protocol authentication"),
+                    ("test-network", "Test network scanning for MAC"),
+                    ("add-external", "Add non-Proxmox host"),
+                    ("install-completion", "Install shell TAB completion"),
+                    ("--onboarding", "Rerun setup wizard"),
+                ]
+
+                for cmd, desc in commands:
+                    cli_table.add_row(cmd, desc)
+
+                console.print(cli_table)
+
+                console.print(
+                    "\n[dim]CLI reference complete. Returning to menu...[/dim]"
+                )
+
+                time.sleep(1.5)  # Brief pause to let user read the message
+
+            elif choice in ("0", "q"):
+                console.print(
+                    Panel(
+                        "[bold green]Thank you for using Guacamole VM Manager![/bold green]",
+                        border_style="green",
+                        padding=(0, 2),
+                    )
+                )
+                break
+            else:
+                console.print(
+                    Panel(
+                        f"[red]Invalid choice: '{choice}'[/red]\nPlease enter a number between 0-7",
+                        border_style="red",
+                        title="[red]Error[/red]",
+                    )
+                )
+
+    except KeyboardInterrupt:
+        console.print(
+            Panel("[yellow]Operation cancelled by user[/yellow]", border_style="yellow")
+        )
+    except Exception as e:
+        console.print(
+            Panel(
+                f"[red]Unexpected error: {e}[/red]",
+                border_style="red",
+                title="[red]Error[/red]",
+            )
+        )
+        raise typer.Exit(1)
+
+
+@app.command("install-completion")
+def install_completion_cmd(
+    shell: str = typer.Option(
+        None, "--shell", help="Shell type (bash, zsh, fish, powershell)"
+    )
+) -> None:
+    """Install shell completion for the CLI"""
+
+    # Detect shell if not provided
+    if not shell:
+        shell_env = os.environ.get("SHELL", "")
+        if "zsh" in shell_env:
+            shell = "zsh"
+        elif "bash" in shell_env:
+            shell = "bash"
+        elif "fish" in shell_env:
+            shell = "fish"
+        else:
+            shell = "bash"  # Default fallback
+
+    console.print(f"[cyan]Setting up completion for {shell}...[/cyan]")
+
+    # Get the full script path for completion
+    script_path = os.path.abspath(sys.argv[0])
+    script_name = os.path.basename(script_path)
+    if script_name.endswith(".py"):
+        base_name = script_name[:-3]  # Remove .py extension
+    else:
+        base_name = script_name
+
+    # Provide installation instructions based on shell
+    if shell == "zsh":
+        console.print("\n[green]Add this line to your ~/.zshrc:[/green]")
+        console.print(
+            f"[dim]eval \"$(_{base_name.upper().replace('-', '_')}_COMPLETE=zsh_source uv run python {script_path})\"[/dim]"
+        )
+        console.print("\n[yellow]Or for this session only, run:[/yellow]")
+        console.print(
+            f"[dim]eval \"$(_{base_name.upper().replace('-', '_')}_COMPLETE=zsh_source uv run python {script_path})\"[/dim]"
+        )
+
+    elif shell == "bash":
+        console.print("\n[green]Add this line to your ~/.bashrc:[/green]")
+        console.print(
+            f"[dim]eval \"$(_{base_name.upper().replace('-', '_')}_COMPLETE=bash_source uv run python {script_path})\"[/dim]"
+        )
+        console.print("\n[yellow]Or for this session only, run:[/yellow]")
+        console.print(
+            f"[dim]eval \"$(_{base_name.upper().replace('-', '_')}_COMPLETE=bash_source uv run python {script_path})\"[/dim]"
+        )
+
+    elif shell == "fish":
+        console.print("\n[green]Add this line to ~/.config/fish/config.fish:[/green]")
+        console.print(
+            f"[dim]eval (env _{base_name.upper().replace('-', '_')}_COMPLETE=fish_source uv run python {script_path})[/dim]"
+        )
+        console.print("\n[yellow]Or for this session only, run:[/yellow]")
+        console.print(
+            f"[dim]eval (env _{base_name.upper().replace('-', '_')}_COMPLETE=fish_source uv run python {script_path})[/dim]"
+        )
+
+    else:
+        console.print(
+            f"[yellow]Shell completion for '{shell}' is not currently supported.[/yellow]"
+        )
+        console.print("Supported shells: bash, zsh, fish")
+
+    console.print("\n[blue]ℹ[/blue] After adding the line, reload your shell with:")
+    console.print(
+        f"[dim]source ~/.{shell}rc[/dim] (for bash/zsh) or restart your terminal"
+    )
+
+    console.print(
+        f"\n[green]✓ Completion setup instructions provided for {shell}[/green]"
+    )
+    console.print(
+        "[dim]TAB completion will be available for commands, options, and some arguments[/dim]"
+    )
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    onboarding: bool = typer.Option(
+        False, "--onboarding", help="Run first-time onboarding wizard"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Enable verbose logging to stdout"
+    ),
+    log_file: str = typer.Option(
+        None, "--log-file", help="Log verbose output to specified file"
+    ),
+    raw: bool = typer.Option(
+        False,
+        "--raw",
+        help="Raw output mode: disable colors, animations, and Rich formatting (applies to all commands)",
+        envvar="GUAC_RAW_MODE"
+    ),
+) -> None:
+    """Guacamole VM Manager - Sync Proxmox VMs with Apache Guacamole"""
+    global verbose_mode, verbose_log_file, raw_mode
+    verbose_mode = verbose
+    if log_file:
+        verbose_mode = True
+        verbose_log_file = log_file
+    
+    # Set raw mode globally
+    raw_mode = raw
+    if raw:
+        # Disable Rich console colors in raw mode
+        console.no_color = True
+        
+    if ctx.invoked_subcommand is None:
+
+        if (
+            os.environ.get("PYTEST_CURRENT_TEST")
+            or os.environ.get("GUAC_SKIP_INTERACTIVE")
+            or os.environ.get("CI")
+            or not sys.stdin.isatty()
+        ):
+            return
+        # Onboarding auto-run if sentinel absent or flag provided
+        if onboarding or not os.path.exists(ONBOARD_SENTINEL):
+            run_onboarding()
+        interactive_menu()
+
+
+if __name__ == "__main__":
+    app()

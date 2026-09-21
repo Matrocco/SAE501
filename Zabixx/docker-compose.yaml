@@ -2,10 +2,10 @@ services:
  server-db-init:
   extends:
    file: compose_zabbix_components.yaml
-   service: server-pgsql-db-init
-  image: "${ZABBIX_SERVER_PGSQL_IMAGE}:${ZBX_IMAGE_TAG}"
+   service: server-mysql-db-init
+  image: "${ZABBIX_SERVER_MYSQL_IMAGE}:${ZBX_IMAGE_TAG}"
   depends_on:
-   postgres-server:
+   mysql-server:
     condition: service_healthy
   labels:
    com.zabbix.os: "${OS}"
@@ -24,12 +24,12 @@ services:
  zabbix-server:
   extends:
    file: compose_zabbix_components.yaml
-   service: server-pgsql
-  image: "${ZABBIX_SERVER_PGSQL_IMAGE}:${ZBX_IMAGE_TAG}"
+   service: server-mysql
+  image: "${ZABBIX_SERVER_MYSQL_IMAGE}:${ZBX_IMAGE_TAG}"
   depends_on:
    server-db-init:
     condition: service_completed_successfully
-   postgres-server:
+   mysql-server:
     condition: service_healthy
   labels:
    com.zabbix.os: "${OS}"
@@ -55,28 +55,28 @@ services:
   labels:
    com.zabbix.os: "${OS}"
 
- zabbix-web-apache-pgsql:
+ zabbix-web-apache-mysql:
   extends:
    file: compose_zabbix_components.yaml
-   service: web-apache-pgsql
-  image: "${ZABBIX_WEB_APACHE_PGSQL_IMAGE}:${ZBX_IMAGE_TAG}"
+   service: web-apache-mysql
+  image: "${ZABBIX_WEB_APACHE_MYSQL_IMAGE}:${ZBX_IMAGE_TAG}"
   depends_on:
    server-db-init:
     condition: service_completed_successfully
-   postgres-server:
+   mysql-server:
     condition: service_healthy
   labels:
    com.zabbix.os: "${OS}"
 
- zabbix-web-nginx-pgsql:
+ zabbix-web-nginx-mysql:
   extends:
    file: compose_zabbix_components.yaml
-   service: web-nginx-pgsql
-  image: "${ZABBIX_WEB_NGINX_PGSQL_IMAGE}:${ZBX_IMAGE_TAG}"
+   service: web-nginx-mysql
+  image: "${ZABBIX_WEB_NGINX_MYSQL_IMAGE}:${ZBX_IMAGE_TAG}"
   depends_on:
    server-db-init:
     condition: service_completed_successfully
-   postgres-server:
+   mysql-server:
     condition: service_healthy
   labels:
    com.zabbix.os: "${OS}"
@@ -114,16 +114,9 @@ services:
    com.zabbix.os: "${OS}"
 
  mysql-server:
-  profiles:
-   - all
   extends:
    file: compose_databases.yaml
    service: mysql-server
-
- postgres-server:
-  extends:
-   file: compose_databases.yaml
-   service: postgres-server
 
  elasticsearch:
   extends:
@@ -179,7 +172,6 @@ networks:
 volumes:
   snmptraps: {}
 #  mysql_socket: {}
-#  pgsql_socket: {}
 
 secrets:
   MYSQL_USER:
@@ -190,7 +182,13 @@ secrets:
     file: ${ENV_VARS_DIRECTORY}/.MYSQL_ROOT_USER
   MYSQL_ROOT_PASSWORD:
     file: ${ENV_VARS_DIRECTORY}/.MYSQL_ROOT_PASSWORD
-  POSTGRES_USER:
-    file: ${ENV_VARS_DIRECTORY}/.POSTGRES_USER
-  POSTGRES_PASSWORD:
-    file: ${ENV_VARS_DIRECTORY}/.POSTGRES_PASSWORD
+#  client-key.pem:
+#    file: ${ENV_VARS_DIRECTORY}/.ZBX_DB_KEY_FILE
+#  client-cert.pem:
+#    file: ${ENV_VARS_DIRECTORY}/.ZBX_DB_CERT_FILE
+#  root-ca.pem:
+#    file: ${ENV_VARS_DIRECTORY}/.ZBX_DB_CA_FILE
+#  server-cert.pem:
+#    file: ${ENV_VARS_DIRECTORY}/.DB_CERT_FILE
+#  server-key.pem:
+#    file: ${ENV_VARS_DIRECTORY}/.DB_KEY_FILE

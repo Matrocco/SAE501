@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   guacd:
     container_name: guacd
@@ -44,4 +46,4 @@ networks:
     driver: bridge
 
 volumes:
-  postgr
+  postgres_data:

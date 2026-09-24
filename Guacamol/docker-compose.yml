@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   guacd:
     container_name: guacd
@@ -40,21 +38,10 @@ services:
       - postgres
     networks:
       - guac_network
-      
-proxmox_sync:
-    container_name: proxmox_sync_script
-    image: mon_script_sync:v1 
-    build: ./proxmox-sync 
-    restart: "no"
-    depends_on:
-      - postgres
-    networks:
-      - guac_network
 
 networks:
   guac_network:
     driver: bridge
 
 volumes:
-  postgres_data:
-administrateur@rt
+  postgr

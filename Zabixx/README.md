@@ -1,6 +1,21 @@
-commande a faire pour qu'il fonctionne
+<aside>
 
-cd Zabbix 
+# commande a faire pour que le Zabbix fonctionne
+
+```jsx
+cd Zabbix
+```
+
+```jsx
 cd env_vars
-sudo apt install rename 
+```
+
+```jsx
+sudo apt install rename
+```
+
+```jsx
 rename 's/^env_/.env_/' env_*
+```
+
+</aside>
